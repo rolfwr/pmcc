@@ -1,0 +1,3 @@
+char lf;
+int main() {
+}
