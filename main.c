@@ -13,7 +13,7 @@
 #define verify(expr) ((expr) ? (void)(0) : verify_fail(#expr, __FILE__, __LINE__, __func__));
 
 void write_string(int fd, const char* str) {
-    int len = strlen(str);
+    size_t len = strlen(str);
     write(fd, str, len);
 }
 
@@ -22,29 +22,41 @@ void write_int(int fd, int value) {
         write_string(fd, "-");
         value = -value;
     }
-    
+
     if (value > 9) {
         int lead = value / 10;
         value =  value - 10 * lead;
         write_int(fd, lead);
     }
 
-    char c = '0' + value;
+    char c = '0' + (char)value;
     write(fd, &c, 1);
 }
 
 void verify_fail(const char* expr, const char* file, int line, const char* function) {
     int err = STDERR_FILENO;
-    write_string(err, "verify: ");
     write_string(err, file);
     write_string(err, ":");
     write_int(err, line);
-    write_string(err, ": ");
+    write_string(err, ":1: error: ");
     write_string(err, function);
-    write_string(err, ": Expectation '");
+    write_string(err, ": verify expectation '");
     write_string(err, expr);
     write_string(err, "' failed.\n");
     abort();
+}
+
+void* xmalloc(size_t bytes) {
+    void* allocated = malloc(bytes);
+    verify(allocated != 0);
+    return allocated;
+}
+
+void* xrealloc(void* ptr, size_t new_size) {
+    assert(ptr != 0);
+    void* reallocated = realloc(ptr, new_size);
+    verify(reallocated != 0);
+    return reallocated;
 }
 
 struct stream {
@@ -57,7 +69,7 @@ void stream_init_openread(struct stream* s, const char* filepath) {
     verify(s->fd != -1);
 }
 
-int stream_read_char(struct stream* s) {    
+int stream_read_char(struct stream* s) {
     char c = 0;
     int count = read(s->fd, &c, 1);
     if (!count) {
@@ -67,9 +79,9 @@ int stream_read_char(struct stream* s) {
     return ic & 255;
 }
 
-void stream_read(struct stream* s, void* buf, size_t nbytes) {
+void stream_read(struct stream* s, void* buf, ssize_t nbytes) {
     ssize_t nread = read(s->fd, buf, nbytes);
-    verify(nread == nbytes);    
+    verify(nread == nbytes);
 }
 
 int stream_tell(struct stream* s) {
@@ -103,6 +115,7 @@ void stream_dump_tail(struct stream* s) {
             char c = ic;
             write(STDOUT_FILENO, &c, 1);
         }
+        i = i - 1;
     }
 
     if (!stream_eof(s)) {
@@ -121,7 +134,7 @@ void dump_not_hint(struct stream* s, const char* what) {
     stream_dump_tail(s);
 }
 
-void fail_expected(struct stream* s, char* expected) {
+void fail_expected(struct stream* s, const char* expected) {
     write_string(STDERR_FILENO, "error: Expected ");
     write_string(STDERR_FILENO, expected);
     write_string(STDERR_FILENO, ", got: ");
@@ -187,21 +200,95 @@ struct patch {
 };
 
 struct patchlist {
-    struct patch entries[16];
     int count;
+    int reserved;
+    struct patch* entries;
 };
 
 void patchlist_init(struct patchlist* pl) {
-    memset(pl, 0, sizeof(struct patchlist));
+    pl->count = 0;
+    pl->reserved = 16;
+    pl->entries = (struct patch*)xmalloc(pl->reserved * sizeof(struct patch));
 }
 
 void patchlist_push(struct patchlist* pl) {
+    assert(pl->count <= pl->reserved);
+    if (pl->count == pl->reserved) {
+        assert(pl->reserved > 0);
+        pl->reserved = pl->reserved * 2;
+        pl->entries = (struct patch*)xrealloc(pl->entries, pl->reserved * sizeof(struct patch));
+    }
+
     pl->count = pl->count + 1;
-    verify(pl->count < 16);
+    assert(pl->count <= pl->reserved);
 }
 
 struct patch* patchlist_back(struct patchlist* pl) {
     return &(pl->entries[pl->count - 1]);
+}
+
+// symbol kinds
+enum {
+    st_none,
+    st_variable,
+    st_function
+};
+
+enum {
+    ts_none,
+    ts_undefined,
+    ts_char,
+    ts_int
+};
+
+int typespecifier_sizeof(int typespec) {
+    verify(typespec == ts_char);
+    return 1;
+}
+
+struct symbol {
+    char* name;
+    int kind;
+    int typespec;
+    // compilation specific
+    int dataoffset;
+};
+
+void symbol_init(struct symbol* sym, char* name) {
+    sym->name = name;
+    sym->kind = st_none;
+    sym->typespec = ts_none;
+    sym->dataoffset = -1;
+}
+
+struct symboltable {
+    struct symbol entries[16];
+    int count;
+};
+
+void symboltable_init(struct symboltable* symtab) {
+    memset(symtab, 0, sizeof(struct symboltable));
+}
+
+struct symbol* symboltable_find(struct symboltable* symtab, char* name) {
+    int i = 0;
+    while (i < symtab->count) {
+        if (strcmp(name, symtab->entries[i].name) == 0) {
+            return &(symtab->entries[i]);
+        }
+
+        i = i + 1;
+    }
+    return 0;
+}
+
+struct symbol* symboltable_add(struct symboltable* symtab, char* name) {
+    assert(symboltable_find(symtab, name) == 0);
+    verify(symtab->count < 16);
+    struct symbol* new_entry = &(symtab->entries[symtab->count]);
+    symtab->count = symtab->count + 1;
+    symbol_init(new_entry, name);
+    return new_entry;
 }
 
 struct output {
@@ -209,19 +296,25 @@ struct output {
     struct buffer data;
     struct constbytetable constbytes;
     struct patchlist patches;
+    struct symboltable symbols;
 };
 
 void output_init(struct output* o, int fd) {
     o->fd = fd;
     buffer_init(&(o->data));
     constbytetable_init(&(o->constbytes));
+    assert(o->constbytes.indexes[42] == -1);
     patchlist_init(&(o->patches));
+    symboltable_init(&(o->symbols));
 }
 
 int output_get_const_byte_data_offset(struct output* o, char value) {
-    int index = value;
+    int index = value & 255;
+    assert(index >= 0 && index <= 255);
+
     int data_offset = o->constbytes.indexes[index];
-    if (o->constbytes.indexes[index] == -1) {
+    assert(o->constbytes.indexes[42] == -1);
+    if (data_offset == -1) {
         data_offset = buffer_expand(&(o->data), 1);
         *buffer_at(&(o->data), data_offset) = value;
         o->constbytes.indexes[index] = data_offset;
@@ -251,7 +344,7 @@ int count_whitespace(struct stream* s) {
 
     char c = ic;
     int is_whitespace = c == ' ' || c == '\n' || c == '\r' || c == '\t';
-    
+
     if (!is_whitespace) {
         // Rewind and return no match
         stream_seek(s, pos);
@@ -346,7 +439,7 @@ int match_id_char(struct stream* s) {
     Examples (expected = "str"):
         str
 */
-int match_string(struct stream* s, char* expected) {
+int match_string(struct stream* s, const char* expected) {
     off_t pos = stream_tell(s);
     while (*expected) {
         int ic = stream_read_char(s);
@@ -357,7 +450,7 @@ int match_string(struct stream* s, char* expected) {
             return 0;
         }
 
-        ++expected;        
+        ++expected;
     }
 
     return 1;
@@ -368,7 +461,7 @@ int match_string(struct stream* s, char* expected) {
         "str\r\n"
         "str    "
 */
-int match_string_with_spacing(struct stream* s, char* expected) {
+int match_string_with_spacing(struct stream* s, const char* expected) {
     if (!match_string(s, expected)) {
         return 0;
     }
@@ -386,7 +479,7 @@ int match_string_with_spacing(struct stream* s, char* expected) {
         examp + le
         NO MATCH
 */
-int match_word(struct stream* s, char* expected) {
+int match_word(struct stream* s, const char* expected) {
     off_t pos = stream_tell(s);
 
     if (!match_string(s, expected)) {
@@ -404,6 +497,8 @@ int match_word(struct stream* s, char* expected) {
     return 1;
 }
 
+
+
 /*
     N2176: 6.7.2 1 type-specifier
         type-specifier <-
@@ -420,7 +515,16 @@ int match_word(struct stream* s, char* expected) {
         "int\r\n"
 */
 int match_type_specifier(struct stream* s) {
-    return match_word(s, "char") || match_word(s, "int");
+    if (match_word(s, "char")) {
+        return ts_char;
+    }
+
+    if (match_word(s, "int")) {
+        return ts_int;
+    }
+
+    assert(!ts_none);
+    return ts_none;
 }
 
 /*
@@ -441,12 +545,6 @@ int match_type_specifier(struct stream* s) {
 */
 int match_declaration_specifiers(struct stream* s) {
     return match_type_specifier(s);
-}
-
-void* xmalloc(size_t bytes) {
-    void* allocated = malloc(bytes);
-    verify(allocated != 0);
-    return allocated;
 }
 
 /*
@@ -475,7 +573,7 @@ char* read_identifier(struct stream* s) {
     stream_seek(s, pos);
 
     // Read as null terminated string.
-    char* id = xmalloc(len + 1);
+    char* id = (char*)malloc(len + 1);
     stream_read(s, id, len);
     id[len] = 0;
 
@@ -503,28 +601,35 @@ char* read_identifier(struct stream* s) {
     Examples:
         main()
         main ( )
+        byte_count
+        lf
 */
-char* read_direct_declarator(struct stream* s) {
+int read_direct_declarator(struct stream* s, struct symbol* decl_out) {
     char* name = read_identifier(s);
     if (!name) {
         return 0;
     }
 
+    decl_out->name = name;
+
     off_t pos = stream_tell(s);
 
     if (!match_string_with_spacing(s, "(")) {
         stream_seek(s, pos);
-        return name;
+        decl_out->kind = st_variable;
+        return 1;
     }
 
     if (!match_string_with_spacing(s, ")")) {
         fail_expected(s, "')'");
 
-        stream_seek(s, pos);        
-        return name;
+        stream_seek(s, pos);
+        decl_out->kind = st_variable;
+        return 1;
     }
 
-    return name;
+    decl_out->kind = st_function;
+    return 1;
 }
 
 /*
@@ -537,9 +642,11 @@ char* read_direct_declarator(struct stream* s) {
     Examples:
         main()
         main ( )
+        byte_count
+        lf
 */
-char* read_declarator(struct stream* s) {
-    return read_direct_declarator(s);
+int read_declarator(struct stream* s, struct symbol* decl_out) {
+    return read_direct_declarator(s, decl_out);
 }
 
 /*
@@ -651,7 +758,7 @@ int read_char(struct stream* s) {
     if (ic != -1) {
         return ic;
     }
-    
+
     ic = stream_read_char(s);
 
     if (ic == -1) {
@@ -785,6 +892,28 @@ int match_primary_expression(struct stream* s, struct value* out_val) {
 
 int process_argument_expression_list(struct stream* s, struct list* args_out, struct output* prog_out);
 
+void output_emit_byte(struct output* prog_out, char byte) {
+    int wrote = write(prog_out->fd, &byte, 1);
+    verify(wrote == 1);
+}
+
+void output_emit_data_pointer(struct output* prog_out, int data_offset) {
+    int placeholder_pos = lseek(prog_out->fd, 0, SEEK_CUR);
+    verify(placeholder_pos != -1);
+
+    // write data pointer:
+    int i = 0;
+    while (i < 4) {
+        output_emit_byte(prog_out, 0);
+        i = i + 1;
+    }
+
+    patchlist_push(&prog_out->patches);
+    struct patch* addrpatch = patchlist_back(&prog_out->patches);
+    addrpatch->offset = data_offset;
+    addrpatch->target = placeholder_pos;
+}
+
 /*
     N2176: 6.5.2 postfix-expression:
         postfix-expression <-
@@ -817,7 +946,7 @@ int process_postfix_expression(struct stream* s, struct value* val_out, struct o
     assert(val_out->type == vt_none);
 
     if (!match_primary_expression(s, val_out)) {
-        return 0;        
+        return 0;
     }
 
     assert(val_out->type != vt_none);
@@ -843,34 +972,31 @@ int process_postfix_expression(struct stream* s, struct value* val_out, struct o
 
     verify(args.count == 1);
     struct value* chararg = list_back(&args);
-    verify(chararg->type == vt_char_constant);
+    int data_offset;
+    if (chararg->type == vt_char_constant) {
+        // Handle specifically:
+        //     putchar('?');
+        assert(chararg->type == vt_char_constant);
+        data_offset = output_get_const_byte_data_offset(prog_out, chararg->char_constant);
+    } else {
+        // Handle specifically:
+        //     putchar(someVariable);
+        verify(chararg->type == vt_identifier);
 
-    char opcode_out = 1;
-    int wrote = write(prog_out->fd, &opcode_out, 1);
-    verify(wrote == 1);
-    
-    int data_offset = output_get_const_byte_data_offset(prog_out, chararg->char_constant);
-
-    int placeholder_pos = lseek(prog_out->fd, 0, SEEK_CUR);
-    verify(placeholder_pos != -1);
-
-    // write data pointer:
-    char placeholder = 0;
-    int i = 0;
-    while (i < 4) {
-        wrote = write(prog_out->fd, &placeholder, 1);
-        verify(wrote == 1);
-        i = i + 1;
+        struct symbol* sym = symboltable_find(&(prog_out->symbols), chararg->identifier);
+        assert(strcmp(sym->name, chararg->identifier) == 0);
+        verify(sym->kind == st_variable);
+        verify(sym->typespec == ts_char);
+        verify(sym->dataoffset != -1);
+        data_offset = sym -> dataoffset;
     }
 
-    patchlist_push(&prog_out->patches);
-    struct patch* addrpatch = patchlist_back(&prog_out->patches);
-    addrpatch->offset = data_offset;
-    addrpatch->target = placeholder_pos;
+    char opcode_out = 1;
+    output_emit_byte(prog_out, opcode_out);
+    output_emit_data_pointer(prog_out, data_offset);
 
     // putchar() returns the given argument unless error occurs.
     memcpy(val_out, chararg, sizeof(struct value));
-
     return 1;
 }
 
@@ -898,7 +1024,7 @@ int process_unary_expression(struct stream* s, struct value* val_out, struct out
     return process_postfix_expression(s, val_out, prog_out);
 }
 
-/* 
+/*
     N2176: 6.5.15 conditional-expression:
         conditional-expression <-
             logical-OR-expression
@@ -971,7 +1097,7 @@ int match_assignment_operator(struct stream* s) {
     return match_equ(s);
 }
 
-void note_processed_as(struct stream* s, off_t pos, char* what) {
+void note_processed_as(struct stream* s, off_t pos, const char* what) {
     write_string(STDERR_FILENO, "note: Processed as ");
     write_string(STDERR_FILENO, what);
     write_string(STDERR_FILENO, ": ");
@@ -1019,11 +1145,46 @@ int process_assignment_expression(struct stream* s, struct value* val_out, struc
     off_t pos = stream_tell(s);
 
     if (match_assignment_operator(s)) {
-        if (!process_assignment_expression(s, val_out, prog_out)) {
+        struct value aexpr;
+        value_init(&aexpr);
+
+        if (!process_assignment_expression(s, &aexpr, prog_out)) {
             note_processed_as(s, pos, "assignment operator");
             fail_expected(s, "assignment expression after assignement operator");
             stream_seek(s, pos);
         }
+
+        // Handle specifically:
+        //     someVariableName = '?'
+
+        verify(val_out->type == vt_identifier);
+
+        struct symbol* variable = symboltable_find(&(prog_out->symbols), val_out->identifier);
+        verify(variable != 0);
+        assert(strcmp(variable->name, val_out->identifier) == 0);
+
+        verify(variable->kind == st_variable);
+        verify(variable->typespec == ts_char);
+
+        verify(aexpr.type == vt_char_constant);
+
+        int vardataoffset = variable->dataoffset;
+        int opcode_sub = 3;
+
+        int negconstoffset = output_get_const_byte_data_offset(prog_out, (256 - aexpr.char_constant) & 255);
+
+        // sub var var
+        // sub var constant((256 - c) & 0xff)
+
+        output_emit_byte(prog_out, opcode_sub);
+        output_emit_data_pointer(prog_out, vardataoffset);
+        output_emit_data_pointer(prog_out, vardataoffset);
+
+        output_emit_byte(prog_out, opcode_sub);
+        output_emit_data_pointer(prog_out, vardataoffset);
+        output_emit_data_pointer(prog_out, negconstoffset);
+
+        memcpy(val_out, &aexpr, sizeof(struct value));
     }
 
     return 1;
@@ -1061,7 +1222,7 @@ int process_argument_expression_list(struct stream* s, struct list* args_out, st
         }
 
         value_init(&val);
-        
+
         if (!process_assignment_expression(s, &val, prog_out)) {
             stream_seek(s, pos);
             return 1;
@@ -1154,9 +1315,11 @@ int process_statement(struct stream* s, struct output* prog_out) {
     Examples:
         main()
         main ( )
+        byte_count
+        lf
 */
-char* read_init_declarator(struct stream* s) {
-    return read_declarator(s);
+int read_init_declarator(struct stream* s, struct symbol* decl_out) {
+    return read_declarator(s, decl_out);
 }
 
 
@@ -1170,9 +1333,11 @@ char* read_init_declarator(struct stream* s) {
     Examples:
         main()
         main ( )
+        byte_count
+        lf
 */
-char* match_init_declarator_list(struct stream* s) {
-    return read_init_declarator(s);
+int match_init_declarator_list(struct stream* s, struct symbol* decl_out) {
+    return read_init_declarator(s, decl_out);
 }
 
 
@@ -1184,18 +1349,25 @@ char* match_init_declarator_list(struct stream* s) {
         declaration <- declaration_specifiers init-declarator-list SEMI
 
     Examples:
-        char foo();
+        char getdirsep();
         int main();
+        int byte_count;
+        char lf;
 
 */
-int match_declaration(struct stream* s) {
+int process_declaration(struct stream* s, struct output* prog_out) {
     off_t pos = stream_tell(s);
 
-    if (!match_declaration_specifiers(s)) {
+    int typespec = match_declaration_specifiers(s);
+
+    if (!typespec) {
         return 0;
     }
 
-    if (!match_init_declarator_list(s)) {
+    struct symbol decllist;
+    symbol_init(&decllist, 0);
+
+    if (!match_init_declarator_list(s, &decllist)) {
         stream_seek(s, pos);
         return 0;
     }
@@ -1205,10 +1377,30 @@ int match_declaration(struct stream* s) {
         return 0;
     }
 
+    // Specifically support:
+    //     char someVariableName;
+    verify(typespec == ts_char);
+
+    verify(symboltable_find(&(prog_out->symbols), decllist.name) == 0);
+
+    struct symbol* newvar = symboltable_add(&(prog_out->symbols), decllist.name);
+
+    assert(newvar != 0);
+    assert(strcmp(newvar->name, decllist.name) == 0);
+    memcpy(newvar, &decllist, sizeof(struct symbol));
+
+    newvar->typespec = typespec;
+
+    // Make appropriate amount of room for the new variable, and remember where
+    // we put it.
+    newvar->dataoffset = buffer_expand(&(prog_out->data), typespecifier_sizeof(newvar->typespec));
+
+    assert(symboltable_find(&(prog_out->symbols), decllist.name) == newvar);
+
     return 1;
 }
 
-/* 
+/*
     N2176: 6.8.2 compound-statement:
         compound-statement <- LWING block-list-item? RWING
         block-list-item <- block-item / block-list-item
@@ -1234,14 +1426,14 @@ int match_compound_statement(struct stream* s, struct output* prog_out) {
 
     int cont = 1;
     while (cont) {
-        cont = match_declaration(s)
+        cont = process_declaration(s, prog_out)
             || process_statement(s, prog_out);
     }
 
     if (!match_string_with_spacing(s, "}")) {
         // Can't unwind processing of statements in compound statement.
         fail_expected(s, "'}'");
-        
+
         stream_seek(s, pos);
         return 0;
     }
@@ -1249,7 +1441,7 @@ int match_compound_statement(struct stream* s, struct output* prog_out) {
     return 1;
 }
 
-/* 
+/*
     N2176: 6.9.1 function-definition:
         function-definition <- declaration-specifiers declarator declaration-list? compound-statement
 
@@ -1257,7 +1449,7 @@ int match_compound_statement(struct stream* s, struct output* prog_out) {
         function_definition <- declaration_specifiers declarator compound_statement
 
     Examples:
-        char getdirsep() { abort(); }
+        char dirsep() { abort(); }
         int main() {}
         int main() { putchar('H'); putchar('\n'); }
         int main() { ;;;; }
@@ -1268,19 +1460,33 @@ int match_function_definition(struct stream* s, struct output* prog_out) {
         return 0;
     }
 
-    char* funcname = read_declarator(s);
-    if (!funcname) {
+    struct symbol func;
+    symbol_init(&func, 0);
+
+    if (!read_declarator(s, &func)) {
         stream_seek(s, pos);
         dump_not_hint(s, __func__);
         return 0;
     }
 
-    if (!match_compound_statement(s, prog_out)) {
+    if (func.kind != st_function) {
+        // Not a function definition. Probably a declaration instead.
+
+        // TODO: Avoid duplicate parsing of declaration_specifiers and
+        // declarator shared between the function_definition and declaration
+        // rules.
         stream_seek(s, pos);
         return 0;
     }
 
-    verify(strcmp(funcname, "main") == 0);
+    assert(func.kind == st_function);
+
+    verify(strcmp(func.name, "main") == 0);
+
+    if (!match_compound_statement(s, prog_out)) {
+        stream_seek(s, pos);
+        return 0;
+    }
 
     char opcode_halt = 0;
     ssize_t written = write(prog_out->fd, &opcode_halt, 1);
@@ -1291,7 +1497,7 @@ int match_function_definition(struct stream* s, struct output* prog_out) {
 /*
     N2176: 6.9 external-declaration:
         external-declaration <- function-definiton / declaration
-    
+
     Implemented:
         external_declaration <- function-definition
 
@@ -1299,10 +1505,10 @@ int match_function_definition(struct stream* s, struct output* prog_out) {
         char getdirsep() { abort(); }
         int main() {}
         int main() { putchar('H'); putchar('\n'); }
-        int main() { ;;;; }
+        char lf;
 */
-int match_external_declaration(struct stream* s, struct output* prog_out) {
-    return match_function_definition(s, prog_out) || match_declaration(s);
+int process_external_declaration(struct stream* s, struct output* prog_out) {
+    return match_function_definition(s, prog_out) || process_declaration(s, prog_out);
 }
 
 /*
@@ -1314,12 +1520,13 @@ int match_external_declaration(struct stream* s, struct output* prog_out) {
 
     Examples:
         int main() {}
-        int main() { putchar('H'); } char unused() { abort(); } 
+        int main() { putchar('H'); } char unused() { abort(); }
+        char lf; int main() { ; }
 */
 void process_translation_unit(struct stream* s, struct output* prog_out) {
     count_spacing(s);
 
-    while (match_external_declaration(s, prog_out)) {
+    while (process_external_declaration(s, prog_out)) {
         // contine
     }
 }
