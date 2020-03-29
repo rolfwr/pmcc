@@ -625,6 +625,11 @@ char* read_identifier(struct stream* s) {
     stream_read(s, id, len);
     id[len] = 0;
 
+    // If we reach this point in the parsing rules, then we expect the not to
+    // match any reserved keywords, since they should have been matched by
+    // other rules earlier instead.
+    assert(strcmp(id, "if") != 0);
+
     count_spacing(s);
 
     return id;
@@ -861,11 +866,59 @@ int read_character_constant(struct stream* s) {
 }
 
 /*
+    N2176: 6.4.4.1 decimal-constant
+        decimal-constant <- nonzero-digit / decimal-constant digit
+
+    Implemented:
+        integer_constant <- [0-9]+
+
+*/
+int match_decimal_constant(struct stream* s, struct value* val_out) {
+    int count = 0;
+    int result = 0;
+    while (1) {
+        int pos = stream_tell(s);
+        int ic = stream_read_char(s);
+        char c = ic;
+        if (ic == -1 || c < '0' || c > '9') {
+            stream_seek(s, pos);
+            if (!count) {
+                return 0;
+            }
+
+            // Only support integer constants that fit in bytes for now.
+            verify(result < 256);
+            val_out->type = vt_char_constant;
+            val_out->char_constant = result;
+            return 1;
+        }
+
+        result = result + (c - '0');
+        count = count + 1;
+    }
+}
+
+/*
+    N2176: 6.4.4.1 integer-constant
+        integer-constant <-
+            decimal-constant integer-suffix?
+            / octal-constant integer-suffix?
+            / hexidecimal-constant integer-suffix?
+
+    Implemented:
+        integer_constant <- decimal_constant
+
+*/
+int match_integer_constant(struct stream* s, struct value* val_out) {
+    return match_decimal_constant(s, val_out);
+}
+
+/*
     N2176: 6.4.4 constant:
         constant <- integer-constant / floating-constant / enumeration-constant / character-constant
 
     Implemented:
-        constant <- character_constant
+        constant <- interger_constant / character_constant
 
     Examples:
         'r'
@@ -874,6 +927,12 @@ int read_character_constant(struct stream* s) {
         '\n'
 */
 int match_constant(struct stream* s, struct value* val_out) {
+    assert(val_out->type == vt_none);
+
+    if (match_integer_constant(s, val_out)) {
+        return 1;
+    }
+
     int charconst = read_character_constant(s);
 
     if (charconst == -1) {
@@ -945,9 +1004,9 @@ void output_emit_byte(struct output* prog_out, char byte) {
     verify(wrote == 1);
 }
 
-void output_emit_data_pointer(struct output* prog_out, int data_offset) {
-    int placeholder_pos = lseek(prog_out->fd, 0, SEEK_CUR);
-    verify(placeholder_pos != -1);
+off_t output_emit_pointer_patch_site(struct output* prog_out) {
+    off_t patch_site = lseek(prog_out->fd, 0, SEEK_CUR);
+    verify(patch_site != -1);
 
     // write data pointer:
     int i = 0;
@@ -956,10 +1015,16 @@ void output_emit_data_pointer(struct output* prog_out, int data_offset) {
         i = i + 1;
     }
 
+    return patch_site;
+}
+
+void output_emit_data_pointer(struct output* prog_out, int data_offset) {
+    off_t patch_site = output_emit_pointer_patch_site(prog_out);
+
     patchlist_push(&prog_out->patches);
     struct patch* addrpatch = patchlist_back(&prog_out->patches);
     addrpatch->offset = data_offset;
-    addrpatch->target = placeholder_pos;
+    addrpatch->target = patch_site;
 }
 
 /*
@@ -1328,10 +1393,8 @@ int process_argument_expression_list(struct stream* s, struct list* args_out, st
         'H'
         putchar('H')
 */
-int process_expression(struct stream* s, struct output* prog_out) {
-    struct value val;
-    value_init(&val);
-    return process_assignment_expression(s, &val, prog_out);
+int process_expression(struct stream* s, struct value* val_out, struct output* prog_out) {
+    return process_assignment_expression(s, val_out, prog_out);
 }
 
 /*
@@ -1350,7 +1413,10 @@ int process_expression(struct stream* s, struct output* prog_out) {
 */
 int process_expression_statement(struct stream* s, struct output* prog_out) {
     off_t pos = stream_tell(s);
-    int saw_expression = process_expression(s, prog_out);
+    struct value val;
+    value_init(&val);
+
+    int saw_expression = process_expression(s, &val, prog_out);
     int saw_semi = match_string_with_spacing(s, ";");
     if (saw_expression && !saw_semi) {
         // Can't unwind processing of expression
@@ -1360,6 +1426,86 @@ int process_expression_statement(struct stream* s, struct output* prog_out) {
     }
 
     return saw_semi;
+}
+
+int process_statement(struct stream* s, struct output* prog_out);
+
+void output_emit_pointer_value(struct output* out, int pointer_value) {
+    int i = 0;
+    while (i < 4) {
+        output_emit_byte(out, pointer_value & 255);
+        pointer_value = pointer_value >> 8;
+        i = i + 1;
+    }
+}
+
+/*
+    N2176: 6.8.4 selection-statement:
+        selection-statement <-
+            / IF LPAR expression RPAR statement
+            / IF LPAR expression RPAR statement ELSE statement
+            / SWITCH LPAR expression RPAR statement
+
+    Implemented:
+        selection_statement <- IF (LPAR expression RPAR statement / fail)
+        LPAR <-  '(' spacing
+        RPAR <-  ')' spacing
+*/
+int process_selection_statement(struct stream* s, struct output* prog_out) {
+    if (!match_word(s, "if")) {
+        return 0;
+    }
+
+    if (!match_string_with_spacing(s, "(")) {
+        fail_expected(s, "'(' after 'if'");
+        return 0;
+    }
+
+    struct value val;
+    value_init(&val);
+    if (!process_expression(s, &val, prog_out)) {
+        fail_expected(s, "condition expression after 'if ('");
+        return 0;
+    }
+
+    if (!match_string_with_spacing(s, ")")) {
+        fail_expected(s, "')' closing if condition expression");
+        return 0;
+    }
+
+    // Only support constant conditionals right now.
+    verify(val.type == vt_char_constant);
+
+    off_t jmppatchsite = -1;
+    if (val.char_constant == 0) {
+        // Need to jump past statement code.
+        output_emit_byte(prog_out, opcode_branch_if_plus);
+        jmppatchsite = output_emit_pointer_patch_site(prog_out);
+
+        int zerooffset = output_get_const_byte_data_offset(prog_out, 0);
+        output_emit_data_pointer(prog_out, zerooffset);
+    }
+
+    if (!process_statement(s, prog_out)) {
+        fail_expected(s, "if body statement");
+        return 0;
+    }
+
+    if (jmppatchsite != -1) {
+        // Patch jump site
+        off_t after = lseek(prog_out->fd, 0, SEEK_CUR);
+        verify(after != -1);
+
+        off_t seeked = lseek(prog_out->fd, jmppatchsite, SEEK_SET);
+        verify(seeked == jmppatchsite);
+
+        output_emit_pointer_value(prog_out, after);
+
+        seeked = lseek(prog_out->fd, after, SEEK_SET);
+        verify(seeked == after);
+    }
+
+    return 1;
 }
 
 /*
@@ -1373,7 +1519,7 @@ int process_expression_statement(struct stream* s, struct output* prog_out) {
             / jump-statement
 
     Implemented:
-        statement <- expression-statement
+        statement <- selection_statement / expression_statement
 
     Examples:
         'H';
@@ -1382,7 +1528,9 @@ int process_expression_statement(struct stream* s, struct output* prog_out) {
         ;
 */
 int process_statement(struct stream* s, struct output* prog_out) {
-    return process_expression_statement(s, prog_out);
+    // We decend into selection_statement before expression_statement to avoid
+    // needlessly trying to parse keywords such as "if" as identifiers.
+    return process_selection_statement(s, prog_out) || process_expression_statement(s, prog_out);
 }
 
 /*
@@ -1633,15 +1781,7 @@ int main(int argc, char** argv) {
         int addr = data_start + data_offset;
 
         // Write little endian 32 bit pointer.
-        int j = 0;
-        while (j < 4) {
-            char b = addr & 0xFF;
-            int wrote = write(prog.fd, &b, 1);
-            verify(wrote == 1);
-            addr = addr >> 8;
-            j = j + 1;
-        }
-
+        output_emit_pointer_value(&prog, addr);
         i = i + 1;
     }
 
