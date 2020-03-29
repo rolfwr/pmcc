@@ -326,7 +326,7 @@ struct output {
     struct constbytetable constbytes;
     struct patchlist patches;
     struct symboltable symbols;
-    int tempbyteoffsets[1];
+    int tempbyteoffsets[16];
     int tempbytecount;
 };
 
@@ -337,7 +337,13 @@ void output_init(struct output* o, int fd) {
     assert(o->constbytes.indexes[42] == -1);
     patchlist_init(&(o->patches));
     symboltable_init(&(o->symbols));
-    o->tempbyteoffsets[0] = -1;
+
+    int i = 0;
+    while (i < 16) {
+        o->tempbyteoffsets[i] = -1;
+        i = i + 1;
+    }
+
     o->tempbytecount = 0;
 }
 
@@ -357,7 +363,7 @@ int output_get_const_byte_data_offset(struct output* o, char value) {
 }
 
 int output_push_tempbyte(struct output* o) {
-    verify(o->tempbytecount < 1);
+    verify(o->tempbytecount < 16);
     int offset = o->tempbyteoffsets[o->tempbytecount];
     if (offset == -1) {
         // Allocate a temporary data byte on demand.
@@ -891,14 +897,17 @@ int match_decimal_constant(struct stream* s, struct value* val_out) {
                 return 0;
             }
 
-            // Only support integer constants that fit in bytes for now.
-            verify(result < 256);
+            int before = result;
             val_out->type = vt_char_constant;
             val_out->char_constant = result;
+
+            // Catch compile-time overflow
+            verify(result >= before);
+
             return 1;
         }
 
-        result = result + (c - '0');
+        result = result * 10 + (c - '0');
         count = count + 1;
     }
 }
@@ -1042,7 +1051,7 @@ void output_emit_data_pointer(struct output* prog_out, int data_offset) {
         character constants ('c')
         variable identifiers (someVariable)
 */
-int output_make_data_offset(struct output* prog_out, struct value* val) {
+int output_make_data_byte_offset(struct output* prog_out, struct value* val) {
     if (val->type == vt_char_constant) {
         // character constants ('c')
         return output_get_const_byte_data_offset(prog_out, val->char_constant);
@@ -1132,7 +1141,7 @@ int process_postfix_expression(struct stream* s, struct value* val_out, struct o
 
     verify(args.count == 1);
     struct value* arg0 = list_back(&args);
-    int data_offset = output_make_data_offset(prog_out, arg0);
+    int data_offset = output_make_data_byte_offset(prog_out, arg0);
 
     output_emit_byte(prog_out, opcode_output_byte);
     output_emit_data_pointer(prog_out, data_offset);
@@ -1288,6 +1297,20 @@ void output_emit_move(struct output* out, int targetdataoffset, int sourcedataof
     output_pop_tempbyte(out);
 }
 
+void output_emit_subtract_const(struct output* out, int targetdataoffset, char constval) {
+    if (constval == 0) {
+        // No need to subtract const zero
+        return;
+    }
+
+    int constvar = output_get_const_byte_data_offset(out, constval);
+    output_emit_subtract(out, targetdataoffset, constvar);
+}
+
+void output_emit_add_const(struct output* out, int targeteoffset, char constval) {
+    output_emit_subtract_const(out, targeteoffset, (256 - constval) & 255);
+}
+
 /*
     N2176: 6.5.16: assignment-expression:
         assignment-expression <- conditional-expression / unary-expression assignment-operator assignment-expression
@@ -1341,7 +1364,7 @@ int process_assignment_expression(struct stream* s, struct value* val_out, struc
             output_emit_negate(prog_out, vardataoffset, negconstoffset);
         } else {
             assert(aexpr.type == vt_identifier);
-            int sourceoffset = output_make_data_offset(prog_out, &aexpr);
+            int sourceoffset = output_make_data_byte_offset(prog_out, &aexpr);
             output_emit_move(prog_out, vardataoffset, sourceoffset);
         }
 
@@ -1455,6 +1478,20 @@ void output_emit_pointer_value(struct output* out, int pointer_value) {
     }
 }
 
+void output_backpatch_address_pointing_here(struct output* out, int patchsite) {
+    off_t here = lseek(out->fd, 0, SEEK_CUR);
+    verify(here != -1);
+
+    off_t seeked = lseek(out->fd, patchsite, SEEK_SET);
+    verify(seeked == patchsite);
+
+    output_emit_pointer_value(out, here);
+
+    seeked = lseek(out->fd, here, SEEK_SET);
+    verify(seeked == here);
+}
+
+
 /*
     N2176: 6.8.4 selection-statement:
         selection-statement <-
@@ -1489,17 +1526,48 @@ int process_selection_statement(struct stream* s, struct output* prog_out) {
         return 0;
     }
 
-    // Only support constant conditionals right now.
-    verify(val.type == vt_char_constant);
+    off_t onfalsepatchsite = -1;
 
-    off_t jmppatchsite = -1;
-    if (val.char_constant == 0) {
-        // Need to jump past statement code.
+    if (val.type == vt_char_constant) {
+
+        // Only support constant conditionals right now.
+        verify(val.type == vt_char_constant);
+
+        if (val.char_constant == 0) {
+            // Need to jump past statement code.
+            output_emit_byte(prog_out, opcode_branch_if_plus);
+            onfalsepatchsite = output_emit_pointer_patch_site(prog_out);
+
+            int zerooffset = output_get_const_byte_data_offset(prog_out, 0);
+            output_emit_data_pointer(prog_out, zerooffset);
+        }
+
+    } else {
+        int valoffset = output_make_data_byte_offset(prog_out, &val);
+
+        int testrange = output_push_tempbyte(prog_out);
+        output_emit_move(prog_out, testrange, valoffset);
+
+        // Handle range 1 -- 128 indicating true:
+        // 255 --> 254   Fall through
+        //   0 --> 255   Fall through
+        //   1 -->   0   Jump to if-body (true)
+        output_emit_subtract_const(prog_out, testrange, 1);
         output_emit_byte(prog_out, opcode_branch_if_plus);
-        jmppatchsite = output_emit_pointer_patch_site(prog_out);
+        int ontruepatchsite = output_emit_pointer_patch_site(prog_out);
+        output_emit_data_pointer(prog_out, testrange);
 
-        int zerooffset = output_get_const_byte_data_offset(prog_out, 0);
-        output_emit_data_pointer(prog_out, zerooffset);
+        // Handle range 129 -- 255 indicating true:
+        // 255 --> 254 --> 255   Fall through to if-body (true)
+        //   0 --> 255 -->   0   Jump past if-body (false)
+        //   1 -->   0 -->   1   N/A, already jumped to if-body above (true)
+        output_emit_add_const(prog_out, testrange, 1);
+        output_emit_byte(prog_out, opcode_branch_if_plus);
+        onfalsepatchsite = output_emit_pointer_patch_site(prog_out);
+        output_emit_data_pointer(prog_out, testrange);
+        output_pop_tempbyte(prog_out);
+
+        output_backpatch_address_pointing_here(prog_out, ontruepatchsite);
     }
 
     if (!process_statement(s, prog_out)) {
@@ -1507,18 +1575,8 @@ int process_selection_statement(struct stream* s, struct output* prog_out) {
         return 0;
     }
 
-    if (jmppatchsite != -1) {
-        // Patch jump site
-        off_t after = lseek(prog_out->fd, 0, SEEK_CUR);
-        verify(after != -1);
-
-        off_t seeked = lseek(prog_out->fd, jmppatchsite, SEEK_SET);
-        verify(seeked == jmppatchsite);
-
-        output_emit_pointer_value(prog_out, after);
-
-        seeked = lseek(prog_out->fd, after, SEEK_SET);
-        verify(seeked == after);
+    if (onfalsepatchsite != -1) {
+        output_backpatch_address_pointing_here(prog_out, onfalsepatchsite);
     }
 
     return 1;
