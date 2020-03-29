@@ -635,6 +635,7 @@ char* read_identifier(struct stream* s) {
     // match any reserved keywords, since they should have been matched by
     // other rules earlier instead.
     assert(strcmp(id, "if") != 0);
+    assert(strcmp(id, "while") != 0);
 
     count_spacing(s);
 
@@ -1023,9 +1024,14 @@ void output_emit_byte(struct output* prog_out, char byte) {
     verify(wrote == 1);
 }
 
+off_t output_get_address_here(struct output* out) {
+    off_t here = lseek(out->fd, 0, SEEK_CUR);
+    verify(here != -1);
+    return here;
+}
+
 off_t output_emit_pointer_patch_site(struct output* prog_out) {
-    off_t patch_site = lseek(prog_out->fd, 0, SEEK_CUR);
-    verify(patch_site != -1);
+    off_t patch_site = output_get_address_here(prog_out);
 
     // write data pointer:
     int i = 0;
@@ -1479,8 +1485,7 @@ void output_emit_pointer_value(struct output* out, int pointer_value) {
 }
 
 void output_backpatch_address_pointing_here(struct output* out, int patchsite) {
-    off_t here = lseek(out->fd, 0, SEEK_CUR);
-    verify(here != -1);
+    off_t here = output_get_address_here(out);
 
     off_t seeked = lseek(out->fd, patchsite, SEEK_SET);
     verify(seeked == patchsite);
@@ -1491,11 +1496,59 @@ void output_backpatch_address_pointing_here(struct output* out, int patchsite) {
     verify(seeked == here);
 }
 
+// Returns jump address patch site or -1 if no patch site was needed because value is always true.
+off_t output_emit_jump_if_zero_with_patch_site(struct output* out, struct value* val) {
+    off_t onfalsepatchsite = -1;
+
+    if (val->type == vt_char_constant) {
+
+        // Only support constant conditionals right now.
+        verify(val->type == vt_char_constant);
+
+        if (val->char_constant == 0) {
+            // Need to jump past statement code.
+            output_emit_byte(out, opcode_branch_if_plus);
+            onfalsepatchsite = output_emit_pointer_patch_site(out);
+
+            int zerooffset = output_get_const_byte_data_offset(out, 0);
+            output_emit_data_pointer(out, zerooffset);
+        }
+
+    } else {
+        int valoffset = output_make_data_byte_offset(out, val);
+
+        int testrange = output_push_tempbyte(out);
+        output_emit_move(out, testrange, valoffset);
+
+        // Handle range 1 -- 128 indicating true:
+        // 255 --> 254   Fall through
+        //   0 --> 255   Fall through
+        //   1 -->   0   Jump to if-body (true)
+        output_emit_subtract_const(out, testrange, 1);
+        output_emit_byte(out, opcode_branch_if_plus);
+        int ontruepatchsite = output_emit_pointer_patch_site(out);
+        output_emit_data_pointer(out, testrange);
+
+        // Handle range 129 -- 255 indicating true:
+        // 255 --> 254 --> 255   Fall through to if-body (true)
+        //   0 --> 255 -->   0   Jump past if-body (false)
+        //   1 -->   0 -->   1   N/A, already jumped to if-body above (true)
+        output_emit_add_const(out, testrange, 1);
+        output_emit_byte(out, opcode_branch_if_plus);
+        onfalsepatchsite = output_emit_pointer_patch_site(out);
+        output_emit_data_pointer(out, testrange);
+        output_pop_tempbyte(out);
+
+        output_backpatch_address_pointing_here(out, ontruepatchsite);
+    }
+
+    return onfalsepatchsite;
+}
 
 /*
     N2176: 6.8.4 selection-statement:
         selection-statement <-
-            / IF LPAR expression RPAR statement
+            IF LPAR expression RPAR statement
             / IF LPAR expression RPAR statement ELSE statement
             / SWITCH LPAR expression RPAR statement
 
@@ -1503,6 +1556,12 @@ void output_backpatch_address_pointing_here(struct output* out, int patchsite) {
         selection_statement <- IF (LPAR expression RPAR statement / fail)
         LPAR <-  '(' spacing
         RPAR <-  ')' spacing
+
+    Examples:
+        if (1) putchar('H');
+        if (error_code) fail = 1;
+        if (ec = get_error()) ;
+        if ('H') 'i';
 */
 int process_selection_statement(struct stream* s, struct output* prog_out) {
     if (!match_word(s, "if")) {
@@ -1526,49 +1585,7 @@ int process_selection_statement(struct stream* s, struct output* prog_out) {
         return 0;
     }
 
-    off_t onfalsepatchsite = -1;
-
-    if (val.type == vt_char_constant) {
-
-        // Only support constant conditionals right now.
-        verify(val.type == vt_char_constant);
-
-        if (val.char_constant == 0) {
-            // Need to jump past statement code.
-            output_emit_byte(prog_out, opcode_branch_if_plus);
-            onfalsepatchsite = output_emit_pointer_patch_site(prog_out);
-
-            int zerooffset = output_get_const_byte_data_offset(prog_out, 0);
-            output_emit_data_pointer(prog_out, zerooffset);
-        }
-
-    } else {
-        int valoffset = output_make_data_byte_offset(prog_out, &val);
-
-        int testrange = output_push_tempbyte(prog_out);
-        output_emit_move(prog_out, testrange, valoffset);
-
-        // Handle range 1 -- 128 indicating true:
-        // 255 --> 254   Fall through
-        //   0 --> 255   Fall through
-        //   1 -->   0   Jump to if-body (true)
-        output_emit_subtract_const(prog_out, testrange, 1);
-        output_emit_byte(prog_out, opcode_branch_if_plus);
-        int ontruepatchsite = output_emit_pointer_patch_site(prog_out);
-        output_emit_data_pointer(prog_out, testrange);
-
-        // Handle range 129 -- 255 indicating true:
-        // 255 --> 254 --> 255   Fall through to if-body (true)
-        //   0 --> 255 -->   0   Jump past if-body (false)
-        //   1 -->   0 -->   1   N/A, already jumped to if-body above (true)
-        output_emit_add_const(prog_out, testrange, 1);
-        output_emit_byte(prog_out, opcode_branch_if_plus);
-        onfalsepatchsite = output_emit_pointer_patch_site(prog_out);
-        output_emit_data_pointer(prog_out, testrange);
-        output_pop_tempbyte(prog_out);
-
-        output_backpatch_address_pointing_here(prog_out, ontruepatchsite);
-    }
+    off_t onfalsepatchsite = output_emit_jump_if_zero_with_patch_site(prog_out, &val);
 
     if (!process_statement(s, prog_out)) {
         fail_expected(s, "if body statement");
@@ -1583,6 +1600,71 @@ int process_selection_statement(struct stream* s, struct output* prog_out) {
 }
 
 /*
+    N2176: 6.8.5 iteration-statement:
+        iteration-statement <-
+            WHILE LPAR expression RPAR statement
+            / DO statement WHILE LPAR expression RPAR SEMI
+            / FOR LPAR expression? SEMI expression? SEMI expersion? RPAR statement
+            / FOR LPAR declaration expression? SEMI expression? SEMI expersion? RPAR statement
+
+    Implemented:
+        iteration_statement <- WHILE (LPAR expression RPAR statement / fail)
+        LPAR <-  '(' spacing
+        RPAR <-  ')' spacing
+
+    Examples:
+        if (1) putchar('*');
+        while (c) { c = d; d = e; }
+        while (process()) ;
+        while (0) 'x';
+*/
+int process_iteration_statement(struct stream* s, struct output* prog_out) {
+    if (!match_word(s, "while")) {
+        return 0;
+    }
+
+    if (!match_string_with_spacing(s, "(")) {
+        fail_expected(s, "'(' after 'while'");
+        return 0;
+    }
+
+    off_t loop_start = output_get_address_here(prog_out);
+
+    struct value val;
+    value_init(&val);
+    if (!process_expression(s, &val, prog_out)) {
+        fail_expected(s, "condition expression after 'while ('");
+        return 0;
+    }
+
+    if (!match_string_with_spacing(s, ")")) {
+        fail_expected(s, "')' closing while condition expression");
+        return 0;
+    }
+
+    off_t onfalsepatchsite = output_emit_jump_if_zero_with_patch_site(prog_out, &val);
+
+    if (!process_statement(s, prog_out)) {
+        fail_expected(s, "while body statement");
+        return 0;
+    }
+
+    // Jump back to start of loop to recheck conditional expression.
+    int oneconst = output_get_const_byte_data_offset(prog_out, 1);
+    output_emit_byte(prog_out, opcode_branch_if_plus);
+    output_emit_pointer_value(prog_out, loop_start);
+    output_emit_data_pointer(prog_out, oneconst);
+
+    if (onfalsepatchsite != -1) {
+        output_backpatch_address_pointing_here(prog_out, onfalsepatchsite);
+    }
+
+    return 1;
+}
+
+int process_compound_statement(struct stream* s, struct output* prog_out);
+
+/*
     N2176: 6.8 statement:
         statement <-
             labeled-statement
@@ -1593,9 +1675,13 @@ int process_selection_statement(struct stream* s, struct output* prog_out) {
             / jump-statement
 
     Implemented:
-        statement <- selection_statement / expression_statement
+        statement <- compound_statement / selection_statement / iteration_statement / expression_statement
 
     Examples:
+        {}
+        { putchar('H'); putchar('i'); }
+        if (1) putchar('H');
+        while (c) { c = d; d = e; }
         'H';
         42;
         error_code = 4;
@@ -1605,7 +1691,10 @@ int process_selection_statement(struct stream* s, struct output* prog_out) {
 int process_statement(struct stream* s, struct output* prog_out) {
     // We decend into selection_statement before expression_statement to avoid
     // needlessly trying to parse keywords such as "if" as identifiers.
-    return process_selection_statement(s, prog_out) || process_expression_statement(s, prog_out);
+    return process_compound_statement(s, prog_out)
+        || process_selection_statement(s, prog_out)
+        || process_iteration_statement(s, prog_out)
+        || process_expression_statement(s, prog_out);
 }
 
 /*
@@ -1717,8 +1806,10 @@ int process_declaration(struct stream* s, struct output* prog_out) {
         { putchar('H'); }
         { char foo(); }
         { 'H'; error_code = 4; putchar('H'); ; 42; }
+        { if (1) { }; while (0) ; }
+        { { } }
 */
-int match_compound_statement(struct stream* s, struct output* prog_out) {
+int process_compound_statement(struct stream* s, struct output* prog_out) {
     off_t pos = stream_tell(s);
 
     if (!match_string_with_spacing(s, "{")) {
@@ -1755,7 +1846,7 @@ int match_compound_statement(struct stream* s, struct output* prog_out) {
         int main() { putchar('H'); putchar('\n'); }
         int main() { ;;;; }
 */
-int match_function_definition(struct stream* s, struct output* prog_out) {
+int process_function_definition(struct stream* s, struct output* prog_out) {
     off_t pos = stream_tell(s);
     if (!match_declaration_specifiers(s)) {
         return 0;
@@ -1784,7 +1875,7 @@ int match_function_definition(struct stream* s, struct output* prog_out) {
 
     verify(strcmp(func.name, "main") == 0);
 
-    if (!match_compound_statement(s, prog_out)) {
+    if (!process_compound_statement(s, prog_out)) {
         stream_seek(s, pos);
         return 0;
     }
@@ -1807,7 +1898,7 @@ int match_function_definition(struct stream* s, struct output* prog_out) {
         char lf;
 */
 int process_external_declaration(struct stream* s, struct output* prog_out) {
-    return match_function_definition(s, prog_out) || process_declaration(s, prog_out);
+    return process_function_definition(s, prog_out) || process_declaration(s, prog_out);
 }
 
 /*
@@ -1844,8 +1935,7 @@ int main(int argc, char** argv) {
 
     process_translation_unit(&s, &prog);
 
-    int data_start = lseek(prog.fd, 0, SEEK_CUR);
-    verify(data_start != -1);
+    int data_start = output_get_address_here(&prog);
 
     // Backpatch pointers to data segment, now that we know where the data segment is.
     int i = 0;
