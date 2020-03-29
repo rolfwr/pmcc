@@ -1,3 +1,32 @@
+/*
+    Guide to reading this source code
+    =================================
+
+    N2176:
+        The latest freely available draft of the C Programming Language standard
+        ISO/IEC 9899:2018
+        https://web.archive.org/web/20181230041359if_/http://www.open-std.org/jtc1/sc22/wg14/www/abq/c17_updated_proposed_fdis.pdf
+
+    match_...(), count_...(), process_...():
+        Recursive decent parsing functions, whose rules are documented using a
+        Parsing Expression Grammar (PEG) like syntax.
+
+        https://en.wikipedia.org/wiki/Recursive_descent_parser
+        https://en.wikipedia.org/wiki/Parsing_expression_grammar
+
+        Functions return a truth-like value if input stream matched rule.
+        When a false-like value is returned, the stream has been rewound back
+        to its position before the rule matching started.
+
+        A process_...() function returning a truth-like value will have
+        performed actions with site-effects, such as outputting compiled code.
+        You should therefore not unwind the stream back past a process_...()
+        call that has returned a truth-like value.
+
+        Stream progress made by match_...() and count_...() can safely be
+        unwound.
+*/
+
 // C Library
 #include <stdio.h>
 #include <assert.h>
@@ -297,6 +326,8 @@ struct output {
     struct constbytetable constbytes;
     struct patchlist patches;
     struct symboltable symbols;
+    int tempbyteoffsets[1];
+    int tempbytecount;
 };
 
 void output_init(struct output* o, int fd) {
@@ -306,6 +337,8 @@ void output_init(struct output* o, int fd) {
     assert(o->constbytes.indexes[42] == -1);
     patchlist_init(&(o->patches));
     symboltable_init(&(o->symbols));
+    o->tempbyteoffsets[0] = -1;
+    o->tempbytecount = 0;
 }
 
 int output_get_const_byte_data_offset(struct output* o, char value) {
@@ -323,8 +356,23 @@ int output_get_const_byte_data_offset(struct output* o, char value) {
     return data_offset;
 }
 
-// The latest freely available draft of ISO/IEC 9899:2018
-// https://web.archive.org/web/20181230041359if_/http://www.open-std.org/jtc1/sc22/wg14/www/abq/c17_updated_proposed_fdis.pdf
+int output_push_tempbyte(struct output* o) {
+    verify(o->tempbytecount < 1);
+    int offset = o->tempbyteoffsets[o->tempbytecount];
+    if (offset == -1) {
+        // Allocate a temporary data byte on demand.
+        offset = buffer_expand(&(o->data), 1);
+        o->tempbyteoffsets[o->tempbytecount] = offset;
+    }
+
+    o->tempbytecount = o-> tempbytecount + 1;
+    return offset;
+}
+
+void output_pop_tempbyte(struct output* o) {
+    assert(o->tempbytecount > 0);
+    o->tempbytecount = o->tempbytecount - 1;
+}
 
 /*
     Implemented:
@@ -354,6 +402,7 @@ int count_whitespace(struct stream* s) {
     // Match
     return 1;
 }
+
 /*
     Spacing <- ( WhiteSpace / LongComment / LineComment / Pragma )*
 
@@ -435,6 +484,7 @@ int match_id_char(struct stream* s) {
     stream_seek(s, pos);
     return 0;
 }
+
 /*
     Examples (expected = "str"):
         str
@@ -496,8 +546,6 @@ int match_word(struct stream* s, const char* expected) {
 
     return 1;
 }
-
-
 
 /*
     N2176: 6.7.2 1 type-specifier
@@ -915,6 +963,42 @@ void output_emit_data_pointer(struct output* prog_out, int data_offset) {
 }
 
 /*
+    Implemented:
+        character constants ('c')
+        variable identifiers (someVariable)
+*/
+int output_make_data_offset(struct output* prog_out, struct value* val) {
+    if (val->type == vt_char_constant) {
+        // character constants ('c')
+        return output_get_const_byte_data_offset(prog_out, val->char_constant);
+    }
+
+    verify(val->type == vt_identifier);
+
+    // variable identifiers (someVariable)
+    struct symbol* sym = symboltable_find(&(prog_out->symbols), val->identifier);
+    assert(strcmp(sym->name, val->identifier) == 0);
+    verify(sym->kind == st_variable);
+    verify(sym->typespec == ts_char);
+    verify(sym->dataoffset != -1);
+    return sym -> dataoffset;
+}
+
+/*
+    The RW2a Instruction Set architecture
+
+    https://github.com/rolfwr/rwisa-vm
+    http://rolfwr.net/tarpit/
+*/
+enum {
+    opcode_halt,            // 00                 exit(0)
+    opcode_output_byte,     // 01 srcptr          putchar(mem[srcptr])
+    opcode_branch_if_plus,  // 02 jmpptr srcptr   if (mem[srcptr] < 128) pc = jmpptr
+    opcode_subtract,        // 03 dstptr srcptr   mem[dstptr] -= mem[srcptr]
+    opcode_input_byte       // 04 dstptr          mem[dstptr] = getchar()
+};
+
+/*
     N2176: 6.5.2 postfix-expression:
         postfix-expression <-
             primary-expression
@@ -971,32 +1055,14 @@ int process_postfix_expression(struct stream* s, struct value* val_out, struct o
     verify(strcmp(val_out->identifier, "putchar") == 0);
 
     verify(args.count == 1);
-    struct value* chararg = list_back(&args);
-    int data_offset;
-    if (chararg->type == vt_char_constant) {
-        // Handle specifically:
-        //     putchar('?');
-        assert(chararg->type == vt_char_constant);
-        data_offset = output_get_const_byte_data_offset(prog_out, chararg->char_constant);
-    } else {
-        // Handle specifically:
-        //     putchar(someVariable);
-        verify(chararg->type == vt_identifier);
+    struct value* arg0 = list_back(&args);
+    int data_offset = output_make_data_offset(prog_out, arg0);
 
-        struct symbol* sym = symboltable_find(&(prog_out->symbols), chararg->identifier);
-        assert(strcmp(sym->name, chararg->identifier) == 0);
-        verify(sym->kind == st_variable);
-        verify(sym->typespec == ts_char);
-        verify(sym->dataoffset != -1);
-        data_offset = sym -> dataoffset;
-    }
-
-    char opcode_out = 1;
-    output_emit_byte(prog_out, opcode_out);
+    output_emit_byte(prog_out, opcode_output_byte);
     output_emit_data_pointer(prog_out, data_offset);
 
     // putchar() returns the given argument unless error occurs.
-    memcpy(val_out, chararg, sizeof(struct value));
+    memcpy(val_out, arg0, sizeof(struct value));
     return 1;
 }
 
@@ -1120,6 +1186,30 @@ void note_processed_as(struct stream* s, off_t pos, const char* what) {
 
     assert(stream_tell(s) == here);
 }
+
+void output_emit_subtract(struct output* out, int targetdataoffset, int sourcedataoffset) {
+    output_emit_byte(out, opcode_subtract);
+    output_emit_data_pointer(out, targetdataoffset);
+    output_emit_data_pointer(out, sourcedataoffset);
+}
+
+void output_emit_set_zero(struct output* out, int targetdataoffset) {
+    output_emit_subtract(out, targetdataoffset, targetdataoffset);
+}
+
+void output_emit_negate(struct output* out, int targetdataoffset, int sourcedataoffset) {
+    assert(targetdataoffset != sourcedataoffset);
+    output_emit_set_zero(out, targetdataoffset);
+    output_emit_subtract(out, targetdataoffset, sourcedataoffset);
+}
+
+void output_emit_move(struct output* out, int targetdataoffset, int sourcedataoffset) {
+    int negtemp = output_push_tempbyte(out);
+    output_emit_negate(out, negtemp, sourcedataoffset);
+    output_emit_negate(out, targetdataoffset, negtemp);
+    output_pop_tempbyte(out);
+}
+
 /*
     N2176: 6.5.16: assignment-expression:
         assignment-expression <- conditional-expression / unary-expression assignment-operator assignment-expression
@@ -1165,24 +1255,16 @@ int process_assignment_expression(struct stream* s, struct value* val_out, struc
 
         verify(variable->kind == st_variable);
         verify(variable->typespec == ts_char);
-
-        verify(aexpr.type == vt_char_constant);
-
         int vardataoffset = variable->dataoffset;
-        int opcode_sub = 3;
 
-        int negconstoffset = output_get_const_byte_data_offset(prog_out, (256 - aexpr.char_constant) & 255);
-
-        // sub var var
-        // sub var constant((256 - c) & 0xff)
-
-        output_emit_byte(prog_out, opcode_sub);
-        output_emit_data_pointer(prog_out, vardataoffset);
-        output_emit_data_pointer(prog_out, vardataoffset);
-
-        output_emit_byte(prog_out, opcode_sub);
-        output_emit_data_pointer(prog_out, vardataoffset);
-        output_emit_data_pointer(prog_out, negconstoffset);
+        if (aexpr.type == vt_char_constant) {
+            int negconstoffset = output_get_const_byte_data_offset(prog_out, (256 - aexpr.char_constant) & 255);
+            output_emit_negate(prog_out, vardataoffset, negconstoffset);
+        } else {
+            assert(aexpr.type == vt_identifier);
+            int sourceoffset = output_make_data_offset(prog_out, &aexpr);
+            output_emit_move(prog_out, vardataoffset, sourceoffset);
+        }
 
         memcpy(val_out, &aexpr, sizeof(struct value));
     }
@@ -1232,7 +1314,6 @@ int process_argument_expression_list(struct stream* s, struct list* args_out, st
         memcpy(list_back(args_out), &val, sizeof(struct value));
     }
 }
-
 
 /*
     N2176: 6.5.17 expression:
@@ -1300,7 +1381,6 @@ int process_expression_statement(struct stream* s, struct output* prog_out) {
         putchar('H');
         ;
 */
-
 int process_statement(struct stream* s, struct output* prog_out) {
     return process_expression_statement(s, prog_out);
 }
@@ -1322,7 +1402,6 @@ int read_init_declarator(struct stream* s, struct symbol* decl_out) {
     return read_declarator(s, decl_out);
 }
 
-
 /*
     N2176: 6.7 init-declarator-list:
         init-declarator-list <- init-declarator / init-declarator-list COMMA init-declarator
@@ -1339,7 +1418,6 @@ int read_init_declarator(struct stream* s, struct symbol* decl_out) {
 int match_init_declarator_list(struct stream* s, struct symbol* decl_out) {
     return read_init_declarator(s, decl_out);
 }
-
 
 /*
     N2176: 6.7 declaration:
@@ -1488,9 +1566,7 @@ int match_function_definition(struct stream* s, struct output* prog_out) {
         return 0;
     }
 
-    char opcode_halt = 0;
-    ssize_t written = write(prog_out->fd, &opcode_halt, 1);
-    verify(written == 1);
+    output_emit_byte(prog_out, opcode_halt);
     return 1;
 }
 
@@ -1499,7 +1575,7 @@ int match_function_definition(struct stream* s, struct output* prog_out) {
         external-declaration <- function-definiton / declaration
 
     Implemented:
-        external_declaration <- function-definition
+        external_declaration <- function-definition / declaration
 
     Examples:
         char getdirsep() { abort(); }
