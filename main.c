@@ -872,6 +872,11 @@ int read_character_constant(struct stream* s) {
     Implemented:
         integer_constant <- [0-9]+
 
+    Examples:
+        0
+        1
+        42
+        255
 */
 int match_decimal_constant(struct stream* s, struct value* val_out) {
     int count = 0;
@@ -908,6 +913,11 @@ int match_decimal_constant(struct stream* s, struct value* val_out) {
     Implemented:
         integer_constant <- decimal_constant
 
+    Examples:
+        0
+        1
+        42
+        255
 */
 int match_integer_constant(struct stream* s, struct value* val_out) {
     return match_decimal_constant(s, val_out);
@@ -922,8 +932,8 @@ int match_integer_constant(struct stream* s, struct value* val_out) {
 
     Examples:
         'r'
+        42
         '"'
-        '\\'
         '\n'
 */
 int match_constant(struct stream* s, struct value* val_out) {
@@ -979,7 +989,7 @@ void list_pop(struct list* l) {
     Examples:
         main
         error_code
-        'r'
+        42
         '\n'
 */
 int match_primary_expression(struct stream* s, struct value* out_val) {
@@ -1084,6 +1094,7 @@ enum {
     Examples:
         error_code
         'H'
+        42
         putchar('H')
         abort()
 
@@ -1148,6 +1159,7 @@ int process_postfix_expression(struct stream* s, struct value* val_out, struct o
     Examples:
         error_code
         'H'
+        42
         putchar('H')
         abort()
 */
@@ -1167,6 +1179,7 @@ int process_unary_expression(struct stream* s, struct value* val_out, struct out
     Examples:
         error_code
         'H'
+        42
         putchar('H')
         abort()
 */
@@ -1286,6 +1299,7 @@ void output_emit_move(struct output* out, int targetdataoffset, int sourcedataof
         error_code
         error_code = 4
         'H'
+        42
         putchar('H')
 
     Examples (ok grammar, semantic error):
@@ -1347,7 +1361,7 @@ int process_assignment_expression(struct stream* s, struct value* val_out, struc
 
     Examples:
         foo = 'A', bar = 'B'
-        'C', main, bar = 'D', baz
+        'C', main, bar = 'D', baz, 42
         'E'
         putchar('F')
 */
@@ -1391,6 +1405,7 @@ int process_argument_expression_list(struct stream* s, struct list* args_out, st
         error_code
         error_code = 4
         'H'
+        42
         putchar('H')
 */
 int process_expression(struct stream* s, struct value* val_out, struct output* prog_out) {
@@ -1407,6 +1422,7 @@ int process_expression(struct stream* s, struct value* val_out, struct output* p
 
     Examples:
         'H';
+        42;
         error_code = 4;
         putchar('H');
         ;
@@ -1523,6 +1539,7 @@ int process_selection_statement(struct stream* s, struct output* prog_out) {
 
     Examples:
         'H';
+        42;
         error_code = 4;
         putchar('H');
         ;
@@ -1641,7 +1658,7 @@ int process_declaration(struct stream* s, struct output* prog_out) {
         {}
         { putchar('H'); }
         { char foo(); }
-        { 'H'; error_code = 4; putchar('H'); ; }
+        { 'H'; error_code = 4; putchar('H'); ; 42; }
 */
 int match_compound_statement(struct stream* s, struct output* prog_out) {
     off_t pos = stream_tell(s);
