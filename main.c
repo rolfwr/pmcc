@@ -192,7 +192,6 @@ void value_init(struct value* val) {
     val->char_data_offset = -1;
 }
 
-
 struct buffer {
     int count;
     int reserved;
@@ -1126,6 +1125,13 @@ void output_emit_move(struct output* out, int targetdataoffset, int sourcedataof
     output_pop_tempbyte(out);
 }
 
+void output_emit_add(struct output* out, int targetdataoffset, int sourcedataoffset) {
+    int negdata = output_push_tempbyte(out);
+    output_emit_negate(out, negdata, sourcedataoffset);
+    output_emit_subtract(out, targetdataoffset, negdata);
+    output_pop_tempbyte(out);
+}
+
 void output_emit_subtract_const(struct output* out, int targetdataoffset, char constval) {
     if (constval == 0) {
         // No need to subtract const zero
@@ -1397,24 +1403,38 @@ void note_processed_as(struct stream* s, off_t pos, const char* what) {
     assert(stream_tell(s) == here);
 }
 
-int match_minus(struct stream* s) {
+int match_string_not_followed_by_char_but_with_spaces(struct stream* s, const char* str, const char* disallowed_chars) {
     off_t pos = stream_tell(s);
-    if (!match_string(s, "-")) {
+    if (!match_string(s, str)) {
         return 0;
     }
 
     off_t after = stream_tell(s);
     int ic = stream_read_char(s);
-    if (ic == '-' || ic == '=' || ic == '>') {
-        note_processed_as(s, pos, "not minus binary");
-        // Not a minus
-        stream_seek(s, pos);
-        return 0;
+    while (*disallowed_chars) {
+        if (ic == *disallowed_chars) {
+            stream_seek(s, pos);
+            return 0;
+        }
+
+        disallowed_chars = disallowed_chars + 1;
     }
 
     stream_seek(s, after);
     count_spacing(s);
     return 1;
+}
+
+// PLUS <- '-' ![\-+=] spacing
+// PLUS <- '+' ![+=] spacing
+char match_plus_or_minus(struct stream* s) {
+    if (match_string_not_followed_by_char_but_with_spaces(s, "+", "+=")) {
+        return '+';
+    } else if (match_string_not_followed_by_char_but_with_spaces(s, "-", "-=>")) {
+        return '-';
+    }
+
+    return 0;
 }
 
 /*
@@ -1425,8 +1445,7 @@ int match_minus(struct stream* s) {
             / addative-expression - multiplicative-expression
 
     Implemented:
-        unary_expression (MINUS unary_expression)
-        MINUS <-  '-' ![\-=>] spacing
+        unary_expression (plus_or_minus unary_expression / fail)*
 
     Examples:
         count - 1
@@ -1439,30 +1458,35 @@ int process_additive_expression(struct stream* s, struct value* val_out, struct 
         return 0;
     }
 
-    if (!match_minus(s)) {
-        return 1;
+    char op = match_plus_or_minus(s);
+    while (op) {
+        struct value rhs;
+        value_init(&rhs);
+
+        if (!process_unary_expression(s, &rhs, prog_out)) {
+            fail_expected(s, "unary expression after binary '-' operator");
+            return 0;
+        }
+
+        // Subtract or add
+        int resultdata = buffer_expand(&(prog_out->data), 1);
+        int lhsdata = output_make_data_byte_offset(prog_out, val_out);
+        int rhsdata = output_make_data_byte_offset(prog_out, &rhs);
+
+        output_emit_move(prog_out, resultdata, lhsdata);
+        if (op == '-') {
+            output_emit_subtract(prog_out, resultdata, rhsdata);
+        } else {
+            assert(op == '+');
+            output_emit_add(prog_out, resultdata, rhsdata);
+        }
+
+        value_init(val_out);
+        val_out->type = vt_char_data;
+        val_out->char_data_offset = resultdata;
+
+        op = match_plus_or_minus(s);
     }
-
-    struct value rhs;
-    value_init(&rhs);
-
-    if (!process_unary_expression(s, &rhs, prog_out)) {
-        fail_expected(s, "unary expression after binary '-' operator");
-        return 0;
-    }
-
-    // TODO: Avoid needless use of data area.
-
-    int resultdata = buffer_expand(&(prog_out->data), 1);
-    int lhsdata = output_make_data_byte_offset(prog_out, val_out);
-    int rhsdata = output_make_data_byte_offset(prog_out, &rhs);
-
-    output_emit_move(prog_out, resultdata, lhsdata);
-    output_emit_subtract(prog_out, resultdata, rhsdata);
-
-    value_init(val_out);
-    val_out->type = vt_char_data;
-    val_out->char_data_offset = resultdata;
 
     return 1;
 }
