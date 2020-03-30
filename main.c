@@ -201,7 +201,7 @@ struct buffer {
 void buffer_init(struct buffer* buf) {
     buf->count = 0;
     buf->reserved = 16;
-    buf->bytes = xmalloc(buf->reserved);
+    buf->bytes = (char*)xmalloc(buf->reserved);
 }
 
 int buffer_expand(struct buffer* buf, int count) {
@@ -209,7 +209,7 @@ int buffer_expand(struct buffer* buf, int count) {
     buf->count = buf->count + count;
     if (buf->count > buf->reserved) {
         buf->reserved = buf->count * 2;
-        buf->bytes = xrealloc(buf->bytes, buf->reserved);
+        buf->bytes = (char*)xrealloc(buf->bytes, buf->reserved);
     }
     return index;
 }
@@ -998,20 +998,24 @@ void list_pop(struct list* l) {
     l->count = l->count - 1;
 }
 
+int process_expression(struct stream* s, struct value* val_out, struct output* prog_out);
+
 /*
     N2176: 6.5.1 1 primary-expression:
         primary-expression <- identifier / constant / string-literal / LPAR expression RPAR / generic-selection
 
     Implemented:
-        primary_expression <- identifier / constant
-
+        primary_expression <- identifier / constant / LPAR (expression RPAR / fail)
+        LPAR <-  '(' spacing
+        RPAR <-  ')' spacing
     Examples:
         main
         error_code
         42
         '\n'
+        (digit - '0')
 */
-int match_primary_expression(struct stream* s, struct value* out_val) {
+int process_primary_expression(struct stream* s, struct value* out_val, struct output* prog_out) {
     char* id = read_identifier(s);
     if (id) {
         out_val->type = vt_identifier;
@@ -1023,7 +1027,21 @@ int match_primary_expression(struct stream* s, struct value* out_val) {
         return 1;
     }
 
-    return 0;
+    if (!match_string_with_spacing(s, "(")) {
+        return 0;
+    }
+
+    if (!process_expression(s, out_val, prog_out)) {
+        fail_expected(s, "expression after '('");
+        return 0;
+    }
+
+    if (!match_string_with_spacing(s, ")")) {
+        fail_expected(s, "')' closing nested expression");
+        return 0;
+    }
+
+    return 1;
 }
 
 int process_argument_expression_list(struct stream* s, struct list* args_out, struct output* prog_out);
@@ -1225,8 +1243,6 @@ off_t output_emit_jump_if_zero_with_patch_site(struct output* out, struct value*
     return onfalsepatchsite;
 }
 
-
-
 /*
     N2176: 6.5.2 postfix-expression:
         postfix-expression <-
@@ -1259,7 +1275,7 @@ off_t output_emit_jump_if_zero_with_patch_site(struct output* out, struct value*
 int process_postfix_expression(struct stream* s, struct value* val_out, struct output* prog_out) {
     assert(val_out->type == vt_none);
 
-    if (!match_primary_expression(s, val_out)) {
+    if (!process_primary_expression(s, val_out, prog_out)) {
         return 0;
     }
 
@@ -1295,6 +1311,7 @@ int process_postfix_expression(struct stream* s, struct value* val_out, struct o
     memcpy(val_out, arg0, sizeof(struct value));
     return 1;
 }
+
 /*
     N2176: 6.5.3 unary-operator:
         AND / STAR / PLUS / MINUS / TILDE / BANG
