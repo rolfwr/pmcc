@@ -174,7 +174,8 @@ void fail_expected(struct stream* s, const char* expected) {
 enum {
     vt_none,
     vt_identifier,
-    vt_char_constant
+    vt_char_constant,
+    vt_char_data
 };
 
 struct value {
@@ -183,26 +184,34 @@ struct value {
     // One of
     char* identifier;
     char char_constant;
+    int char_data_offset;
 };
 
 void value_init(struct value* val) {
     memset(val, 0, sizeof(struct value));
+    val->char_data_offset = -1;
 }
 
 
 struct buffer {
-    char bytes[32];
     int count;
+    int reserved;
+    char* bytes;
 };
 
 void buffer_init(struct buffer* buf) {
-    memset(buf, 0, sizeof(struct buffer));
+    buf->count = 0;
+    buf->reserved = 16;
+    buf->bytes = xmalloc(buf->reserved);
 }
 
 int buffer_expand(struct buffer* buf, int count) {
     int index = buf->count;
     buf->count = buf->count + count;
-    verify(buf->count <= 32);
+    if (buf->count > buf->reserved) {
+        buf->reserved = buf->count * 2;
+        buf->bytes = xrealloc(buf->bytes, buf->reserved);
+    }
     return index;
 }
 
@@ -646,12 +655,12 @@ char* read_identifier(struct stream* s) {
     N2176: 6.7.6 direct-declarator:
         direct-declarator <-
             identifier
-            / LPAR Declarator RPAR
-            / LBRK type-qualifier-list? assignment-expression? RBRK
-            / LBRK STATIC type-qualifier-list? assignment-expression RBRK
-            / LBRK STATIC type-qualifier-list? STAR RBRK
-            / LPAR parameter-type-list RPAR
-            / LPAR identifier-list? RPAR
+            / direct-declarator LPAR Declarator RPAR
+            / direct-declarator LBRK type-qualifier-list? assignment-expression? RBRK
+            / direct-declarator LBRK STATIC type-qualifier-list? assignment-expression RBRK
+            / direct-declarator LBRK STATIC type-qualifier-list? STAR RBRK
+            / direct-declarator LPAR parameter-type-list RPAR
+            / direct-declarator LPAR identifier-list? RPAR
 
     Implemented:
         direct_declarator <- identifier (LPAR (RPAR / fail))?
@@ -877,7 +886,7 @@ int read_character_constant(struct stream* s) {
         decimal-constant <- nonzero-digit / decimal-constant digit
 
     Implemented:
-        integer_constant <- [0-9]+
+        integer_constant <- [0-9]+ spacing
 
     Examples:
         0
@@ -905,6 +914,7 @@ int match_decimal_constant(struct stream* s, struct value* val_out) {
             // Catch compile-time overflow
             verify(result >= before);
 
+            count_spacing(s);
             return 1;
         }
 
@@ -1063,6 +1073,11 @@ int output_make_data_byte_offset(struct output* prog_out, struct value* val) {
         return output_get_const_byte_data_offset(prog_out, val->char_constant);
     }
 
+    if (val->type == vt_char_data) {
+        assert(val->char_data_offset != -1);
+        return val->char_data_offset;
+    }
+
     verify(val->type == vt_identifier);
 
     // variable identifiers (someVariable)
@@ -1087,6 +1102,43 @@ enum {
     opcode_subtract,        // 03 dstptr srcptr   mem[dstptr] -= mem[srcptr]
     opcode_input_byte       // 04 dstptr          mem[dstptr] = getchar()
 };
+
+void output_emit_subtract(struct output* out, int targetdataoffset, int sourcedataoffset) {
+    output_emit_byte(out, opcode_subtract);
+    output_emit_data_pointer(out, targetdataoffset);
+    output_emit_data_pointer(out, sourcedataoffset);
+}
+
+void output_emit_set_zero(struct output* out, int targetdataoffset) {
+    output_emit_subtract(out, targetdataoffset, targetdataoffset);
+}
+
+void output_emit_negate(struct output* out, int targetdataoffset, int sourcedataoffset) {
+    assert(targetdataoffset != sourcedataoffset);
+    output_emit_set_zero(out, targetdataoffset);
+    output_emit_subtract(out, targetdataoffset, sourcedataoffset);
+}
+
+void output_emit_move(struct output* out, int targetdataoffset, int sourcedataoffset) {
+    int negtemp = output_push_tempbyte(out);
+    output_emit_negate(out, negtemp, sourcedataoffset);
+    output_emit_negate(out, targetdataoffset, negtemp);
+    output_pop_tempbyte(out);
+}
+
+void output_emit_subtract_const(struct output* out, int targetdataoffset, char constval) {
+    if (constval == 0) {
+        // No need to subtract const zero
+        return;
+    }
+
+    int constvar = output_get_const_byte_data_offset(out, constval);
+    output_emit_subtract(out, targetdataoffset, constvar);
+}
+
+void output_emit_add_const(struct output* out, int targeteoffset, char constval) {
+    output_emit_subtract_const(out, targeteoffset, (256 - constval) & 255);
+}
 
 /*
     N2176: 6.5.2 postfix-expression:
@@ -1182,6 +1234,100 @@ int process_unary_expression(struct stream* s, struct value* val_out, struct out
     return process_postfix_expression(s, val_out, prog_out);
 }
 
+void note_processed_as(struct stream* s, off_t pos, const char* what) {
+    write_string(STDERR_FILENO, "note: Processed as ");
+    write_string(STDERR_FILENO, what);
+    write_string(STDERR_FILENO, ": ");
+
+    off_t here = stream_tell(s);
+    stream_seek(s, pos);
+
+    int count = here - pos;
+    while (count > 0) {
+        int ic = stream_read_char(s);
+        verify(ic != -1);
+        char c = ic;
+        int wrote = write(STDERR_FILENO, &c, 1);
+        verify(wrote == 1);
+
+        count = count - 1;
+    }
+
+    write_string(STDERR_FILENO, "\n");
+
+    assert(stream_tell(s) == here);
+}
+
+int match_minus(struct stream* s) {
+    off_t pos = stream_tell(s);
+    if (!match_string(s, "-")) {
+        return 0;
+    }
+
+    off_t after = stream_tell(s);
+    int ic = stream_read_char(s);
+    if (ic == '-' || ic == '=' || ic == '>') {
+        note_processed_as(s, pos, "not minus binary");
+        // Not a minus
+        stream_seek(s, pos);
+        return 0;
+    }
+
+    stream_seek(s, after);
+    count_spacing(s);
+    return 1;
+}
+
+/*
+    N2176: additive-expression:
+        additive-expression <-
+            multiplicative-expression
+            / addative-expression + multiplicative-expression
+            / addative-expression - multiplicative-expression
+
+    Implemented:
+        unary_expression (MINUS unary_expression)
+        MINUS <-  '-' ![\-=>] spacing
+
+    Examples:
+        count - 1
+        digit - '0'
+        putchar('H')
+        abort()
+*/
+int process_additive_expression(struct stream* s, struct value* val_out, struct output* prog_out) {
+    if (!process_unary_expression(s, val_out, prog_out)) {
+        return 0;
+    }
+
+    if (!match_minus(s)) {
+        return 1;
+    }
+
+    struct value rhs;
+    value_init(&rhs);
+
+    if (!process_unary_expression(s, &rhs, prog_out)) {
+        fail_expected(s, "unary expression after binary '-' operator");
+        return 0;
+    }
+
+    // TODO: Avoid needless use of data area.
+
+    int resultdata = buffer_expand(&(prog_out->data), 1);
+    int lhsdata = output_make_data_byte_offset(prog_out, val_out);
+    int rhsdata = output_make_data_byte_offset(prog_out, &rhs);
+
+    output_emit_move(prog_out, resultdata, lhsdata);
+    output_emit_subtract(prog_out, resultdata, rhsdata);
+
+    value_init(val_out);
+    val_out->type = vt_char_data;
+    val_out->char_data_offset = resultdata;
+
+    return 1;
+}
+
 /*
     N2176: 6.5.15 conditional-expression:
         conditional-expression <-
@@ -1189,17 +1335,16 @@ int process_unary_expression(struct stream* s, struct value* val_out, struct out
             / logical-OR-expression QUERY expression COLON conditional-expression
 
     Implemented:
-        conditional-expression <- unary_expression
+        conditional_expression <- additive_expression
 
     Examples:
-        error_code
-        'H'
-        42
+        count - 1
+        digit - '0'
         putchar('H')
         abort()
 */
 int process_conditional_expression(struct stream* s, struct value* val_out, struct output* prog_out) {
-    return process_postfix_expression(s, val_out, prog_out);
+    return process_additive_expression(s, val_out, prog_out);
 }
 
 /*
@@ -1256,67 +1401,6 @@ int match_assignment_operator(struct stream* s) {
     return match_equ(s);
 }
 
-void note_processed_as(struct stream* s, off_t pos, const char* what) {
-    write_string(STDERR_FILENO, "note: Processed as ");
-    write_string(STDERR_FILENO, what);
-    write_string(STDERR_FILENO, ": ");
-
-    off_t here = stream_tell(s);
-    stream_seek(s, pos);
-
-    int count = here - pos;
-    while (count > 0) {
-        int ic = stream_read_char(s);
-        verify(ic != -1);
-        char c = ic;
-        int wrote = write(STDERR_FILENO, &c, 1);
-        verify(wrote == 1);
-
-        count = count - 1;
-    }
-
-    write_string(STDERR_FILENO, "\n");
-
-    assert(stream_tell(s) == here);
-}
-
-void output_emit_subtract(struct output* out, int targetdataoffset, int sourcedataoffset) {
-    output_emit_byte(out, opcode_subtract);
-    output_emit_data_pointer(out, targetdataoffset);
-    output_emit_data_pointer(out, sourcedataoffset);
-}
-
-void output_emit_set_zero(struct output* out, int targetdataoffset) {
-    output_emit_subtract(out, targetdataoffset, targetdataoffset);
-}
-
-void output_emit_negate(struct output* out, int targetdataoffset, int sourcedataoffset) {
-    assert(targetdataoffset != sourcedataoffset);
-    output_emit_set_zero(out, targetdataoffset);
-    output_emit_subtract(out, targetdataoffset, sourcedataoffset);
-}
-
-void output_emit_move(struct output* out, int targetdataoffset, int sourcedataoffset) {
-    int negtemp = output_push_tempbyte(out);
-    output_emit_negate(out, negtemp, sourcedataoffset);
-    output_emit_negate(out, targetdataoffset, negtemp);
-    output_pop_tempbyte(out);
-}
-
-void output_emit_subtract_const(struct output* out, int targetdataoffset, char constval) {
-    if (constval == 0) {
-        // No need to subtract const zero
-        return;
-    }
-
-    int constvar = output_get_const_byte_data_offset(out, constval);
-    output_emit_subtract(out, targetdataoffset, constvar);
-}
-
-void output_emit_add_const(struct output* out, int targeteoffset, char constval) {
-    output_emit_subtract_const(out, targeteoffset, (256 - constval) & 255);
-}
-
 /*
     N2176: 6.5.16: assignment-expression:
         assignment-expression <- conditional-expression / unary-expression assignment-operator assignment-expression
@@ -1325,11 +1409,12 @@ void output_emit_add_const(struct output* out, int targeteoffset, char constval)
         assignment_expression <- conditional-expression (assignment_operator (assignment_expression / fail))?
 
     Examples:
-        error_code
-        error_code = 4
-        'H'
+        count = count - 1
+        val = digit - '0'
         42
+        error_code
         putchar('H')
+        abort()
 
     Examples (ok grammar, semantic error):
         'H' = 4
@@ -1369,7 +1454,6 @@ int process_assignment_expression(struct stream* s, struct value* val_out, struc
             int negconstoffset = output_get_const_byte_data_offset(prog_out, (256 - aexpr.char_constant) & 255);
             output_emit_negate(prog_out, vardataoffset, negconstoffset);
         } else {
-            assert(aexpr.type == vt_identifier);
             int sourceoffset = output_make_data_byte_offset(prog_out, &aexpr);
             output_emit_move(prog_out, vardataoffset, sourceoffset);
         }
@@ -1389,7 +1473,9 @@ int process_assignment_expression(struct stream* s, struct value* val_out, struc
         COMMA <- ',' spacing
 
     Examples:
+        'a', 42, '\n'
         foo = 'A', bar = 'B'
+        count = count - 1, val = digit - '0', 42, error_code
         'C', main, bar = 'D', baz, 42
         'E'
         putchar('F')
@@ -1431,11 +1517,12 @@ int process_argument_expression_list(struct stream* s, struct list* args_out, st
         expression <- process_assignment_expression
 
     Examples:
-        error_code
-        error_code = 4
-        'H'
+        count = count - 1
+        val = digit - '0'
         42
+        error_code
         putchar('H')
+        abort()
 */
 int process_expression(struct stream* s, struct value* val_out, struct output* prog_out) {
     return process_assignment_expression(s, val_out, prog_out);
@@ -1450,10 +1537,10 @@ int process_expression(struct stream* s, struct value* val_out, struct output* p
         SEMI <- ';' spacing
 
     Examples:
-        'H';
-        42;
-        error_code = 4;
+        count = count - 1;
         putchar('H');
+        error_code;
+        42;
         ;
 */
 int process_expression_statement(struct stream* s, struct output* prog_out) {
@@ -1559,7 +1646,7 @@ off_t output_emit_jump_if_zero_with_patch_site(struct output* out, struct value*
 
     Examples:
         if (1) putchar('H');
-        if (error_code) fail = 1;
+        if (error_code) retries = retries - 1;
         if (ec = get_error()) ;
         if ('H') 'i';
 */
@@ -1613,8 +1700,7 @@ int process_selection_statement(struct stream* s, struct output* prog_out) {
         RPAR <-  ')' spacing
 
     Examples:
-        if (1) putchar('*');
-        while (c) { c = d; d = e; }
+        while (count) { count = count - 1; putchar('*'); }
         while (process()) ;
         while (0) 'x';
 */
@@ -1681,7 +1767,7 @@ int process_compound_statement(struct stream* s, struct output* prog_out);
         {}
         { putchar('H'); putchar('i'); }
         if (1) putchar('H');
-        while (c) { c = d; d = e; }
+        while (count) { count = count - 1; putchar('*'); }
         'H';
         42;
         error_code = 4;
@@ -1805,7 +1891,7 @@ int process_declaration(struct stream* s, struct output* prog_out) {
         {}
         { putchar('H'); }
         { char foo(); }
-        { 'H'; error_code = 4; putchar('H'); ; 42; }
+        { 'H'; error_code = 4; putchar('H'); ; 42 - 3; }
         { if (1) { }; while (0) ; }
         { { } }
 */
@@ -1912,6 +1998,7 @@ int process_external_declaration(struct stream* s, struct output* prog_out) {
         int main() {}
         int main() { putchar('H'); } char unused() { abort(); }
         char lf; int main() { ; }
+        char c;int main(){c=10;while(c){putchar('*');c=c-1;}}
 */
 void process_translation_unit(struct stream* s, struct output* prog_out) {
     count_spacing(s);

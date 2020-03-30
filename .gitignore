@@ -5,3 +5,4 @@ tests/*.rw2a
 tests/*.rw2a.out
 _*
 main
+out.rw2a
