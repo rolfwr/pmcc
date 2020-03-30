@@ -1140,6 +1140,87 @@ void output_emit_add_const(struct output* out, int targeteoffset, char constval)
     output_emit_subtract_const(out, targeteoffset, (256 - constval) & 255);
 }
 
+void output_emit_pointer_value(struct output* out, int pointer_value) {
+    int i = 0;
+    while (i < 4) {
+        output_emit_byte(out, pointer_value & 255);
+        pointer_value = pointer_value >> 8;
+        i = i + 1;
+    }
+}
+
+void output_backpatch_address_pointing_here(struct output* out, off_t patchsite) {
+    off_t here = output_get_address_here(out);
+
+    off_t seeked = lseek(out->fd, patchsite, SEEK_SET);
+    verify(seeked == patchsite);
+
+    output_emit_pointer_value(out, here);
+
+    seeked = lseek(out->fd, here, SEEK_SET);
+    verify(seeked == here);
+}
+
+ off_t output_emit_jump_with_patch_site(struct output* out) {
+         // Jump back to start of loop to recheck conditional expression.1
+    int oneconst = output_get_const_byte_data_offset(out, 1);
+    output_emit_byte(out, opcode_branch_if_plus);
+    off_t patchsite = output_emit_pointer_patch_site(out);
+    output_emit_data_pointer(out, oneconst);
+    return patchsite;
+ }
+
+// Returns jump address patch site or -1 if no patch site was needed because value is always true.
+off_t output_emit_jump_if_zero_with_patch_site(struct output* out, struct value* val) {
+    off_t onfalsepatchsite = -1;
+
+    if (val->type == vt_char_constant) {
+
+        // Only support constant conditionals right now.
+        verify(val->type == vt_char_constant);
+
+        if (val->char_constant == 0) {
+            // Need to jump past statement code.
+            output_emit_byte(out, opcode_branch_if_plus);
+            onfalsepatchsite = output_emit_pointer_patch_site(out);
+
+            int zerooffset = output_get_const_byte_data_offset(out, 0);
+            output_emit_data_pointer(out, zerooffset);
+        }
+
+    } else {
+        int valoffset = output_make_data_byte_offset(out, val);
+
+        int testrange = output_push_tempbyte(out);
+        output_emit_move(out, testrange, valoffset);
+
+        // Handle range 1 -- 128 indicating true:
+        // 255 --> 254   Fall through
+        //   0 --> 255   Fall through
+        //   1 -->   0   Jump to if-body (true)
+        output_emit_subtract_const(out, testrange, 1);
+        output_emit_byte(out, opcode_branch_if_plus);
+        int ontruepatchsite = output_emit_pointer_patch_site(out);
+        output_emit_data_pointer(out, testrange);
+
+        // Handle range 129 -- 255 indicating true:
+        // 255 --> 254 --> 255   Fall through to if-body (true)
+        //   0 --> 255 -->   0   Jump past if-body (false)
+        //   1 -->   0 -->   1   N/A, already jumped to if-body above (true)
+        output_emit_add_const(out, testrange, 1);
+        output_emit_byte(out, opcode_branch_if_plus);
+        onfalsepatchsite = output_emit_pointer_patch_site(out);
+        output_emit_data_pointer(out, testrange);
+        output_pop_tempbyte(out);
+
+        output_backpatch_address_pointing_here(out, ontruepatchsite);
+    }
+
+    return onfalsepatchsite;
+}
+
+
+
 /*
     N2176: 6.5.2 postfix-expression:
         postfix-expression <-
@@ -1208,6 +1289,31 @@ int process_postfix_expression(struct stream* s, struct value* val_out, struct o
     memcpy(val_out, arg0, sizeof(struct value));
     return 1;
 }
+/*
+    N2176: 6.5.3 unary-operator:
+        AND / STAR / PLUS / MINUS / TILDE / BANG
+
+    Implemented:
+        BANG spacing
+
+    Examples:
+        !
+*/
+char match_unary_operator(struct stream* s) {
+    off_t pos = stream_tell(s);
+    int ic = stream_read_char(s);
+    if (ic == -1) {
+        return 0;
+    }
+    char c = ic;
+
+    if (c == '!') {
+        return c;
+    }
+
+    stream_seek(s, pos);
+    return 0;
+}
 
 /*
     N2176: 6.5.3 unary-expression:
@@ -1221,17 +1327,50 @@ int process_postfix_expression(struct stream* s, struct value* val_out, struct o
             / ALIGNOF LPAR type-name RPAR
 
     Implemented:
-        unary_expression <- postfix_expression
+        unary_expression <-
+            postfix_expression
+            / unary_operator (unary_expression / fail)
 
     Examples:
-        error_code
+        !error_code
         'H'
         42
         putchar('H')
         abort()
 */
 int process_unary_expression(struct stream* s, struct value* val_out, struct output* prog_out) {
-    return process_postfix_expression(s, val_out, prog_out);
+    if (process_postfix_expression(s, val_out, prog_out)) {
+        return 1;
+    }
+
+    char op = match_unary_operator(s);
+    if (!op) {
+        return 0;
+    }
+
+    verify(op == '!');
+
+    if (!process_unary_expression(s, val_out, prog_out)) {
+        fail_expected(s, "unary expression after '!'");
+        return 0;
+    }
+
+    int notdata = buffer_expand(&(prog_out->data), 1);
+    output_emit_set_zero(prog_out, notdata);
+
+
+    off_t onfalse_output1 = output_emit_jump_if_zero_with_patch_site(prog_out, val_out);
+    off_t ontrue_output0 = output_emit_jump_with_patch_site(prog_out);
+
+    output_backpatch_address_pointing_here(prog_out, onfalse_output1);
+    output_emit_add_const(prog_out, notdata, 1);
+
+    output_backpatch_address_pointing_here(prog_out, ontrue_output0);
+
+    value_init(val_out);
+    val_out->type = vt_char_data;
+    val_out->char_data_offset = notdata;
+    return 1;
 }
 
 void note_processed_as(struct stream* s, off_t pos, const char* what) {
@@ -1412,7 +1551,7 @@ int match_assignment_operator(struct stream* s) {
         count = count - 1
         val = digit - '0'
         42
-        error_code
+        !error_code
         putchar('H')
         abort()
 
@@ -1475,7 +1614,7 @@ int process_assignment_expression(struct stream* s, struct value* val_out, struc
     Examples:
         'a', 42, '\n'
         foo = 'A', bar = 'B'
-        count = count - 1, val = digit - '0', 42, error_code
+        count = count - 1, val = digit - '0', 42, !error_code
         'C', main, bar = 'D', baz, 42
         'E'
         putchar('F')
@@ -1562,76 +1701,6 @@ int process_expression_statement(struct stream* s, struct output* prog_out) {
 
 int process_statement(struct stream* s, struct output* prog_out);
 
-void output_emit_pointer_value(struct output* out, int pointer_value) {
-    int i = 0;
-    while (i < 4) {
-        output_emit_byte(out, pointer_value & 255);
-        pointer_value = pointer_value >> 8;
-        i = i + 1;
-    }
-}
-
-void output_backpatch_address_pointing_here(struct output* out, int patchsite) {
-    off_t here = output_get_address_here(out);
-
-    off_t seeked = lseek(out->fd, patchsite, SEEK_SET);
-    verify(seeked == patchsite);
-
-    output_emit_pointer_value(out, here);
-
-    seeked = lseek(out->fd, here, SEEK_SET);
-    verify(seeked == here);
-}
-
-// Returns jump address patch site or -1 if no patch site was needed because value is always true.
-off_t output_emit_jump_if_zero_with_patch_site(struct output* out, struct value* val) {
-    off_t onfalsepatchsite = -1;
-
-    if (val->type == vt_char_constant) {
-
-        // Only support constant conditionals right now.
-        verify(val->type == vt_char_constant);
-
-        if (val->char_constant == 0) {
-            // Need to jump past statement code.
-            output_emit_byte(out, opcode_branch_if_plus);
-            onfalsepatchsite = output_emit_pointer_patch_site(out);
-
-            int zerooffset = output_get_const_byte_data_offset(out, 0);
-            output_emit_data_pointer(out, zerooffset);
-        }
-
-    } else {
-        int valoffset = output_make_data_byte_offset(out, val);
-
-        int testrange = output_push_tempbyte(out);
-        output_emit_move(out, testrange, valoffset);
-
-        // Handle range 1 -- 128 indicating true:
-        // 255 --> 254   Fall through
-        //   0 --> 255   Fall through
-        //   1 -->   0   Jump to if-body (true)
-        output_emit_subtract_const(out, testrange, 1);
-        output_emit_byte(out, opcode_branch_if_plus);
-        int ontruepatchsite = output_emit_pointer_patch_site(out);
-        output_emit_data_pointer(out, testrange);
-
-        // Handle range 129 -- 255 indicating true:
-        // 255 --> 254 --> 255   Fall through to if-body (true)
-        //   0 --> 255 -->   0   Jump past if-body (false)
-        //   1 -->   0 -->   1   N/A, already jumped to if-body above (true)
-        output_emit_add_const(out, testrange, 1);
-        output_emit_byte(out, opcode_branch_if_plus);
-        onfalsepatchsite = output_emit_pointer_patch_site(out);
-        output_emit_data_pointer(out, testrange);
-        output_pop_tempbyte(out);
-
-        output_backpatch_address_pointing_here(out, ontruepatchsite);
-    }
-
-    return onfalsepatchsite;
-}
-
 /*
     N2176: 6.8.4 selection-statement:
         selection-statement <-
@@ -1646,7 +1715,7 @@ off_t output_emit_jump_if_zero_with_patch_site(struct output* out, struct value*
 
     Examples:
         if (1) putchar('H');
-        if (error_code) retries = retries - 1;
+        if (!ok) retries = retries - 1;
         if (ec = get_error()) ;
         if ('H') 'i';
 */
@@ -1735,7 +1804,7 @@ int process_iteration_statement(struct stream* s, struct output* prog_out) {
         return 0;
     }
 
-    // Jump back to start of loop to recheck conditional expression.
+    // Jump back to start of loop to recheck conditional expression.1
     int oneconst = output_get_const_byte_data_offset(prog_out, 1);
     output_emit_byte(prog_out, opcode_branch_if_plus);
     output_emit_pointer_value(prog_out, loop_start);
@@ -1891,7 +1960,7 @@ int process_declaration(struct stream* s, struct output* prog_out) {
         {}
         { putchar('H'); }
         { char foo(); }
-        { 'H'; error_code = 4; putchar('H'); ; 42 - 3; }
+        { 'H'; error_code = 4; putchar('H'); ; 42 - 3; !ok; }
         { if (1) { }; while (0) ; }
         { { } }
 */
