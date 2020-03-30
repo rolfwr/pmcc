@@ -1185,14 +1185,28 @@ void output_backpatch_address_pointing_here(struct output* out, off_t patchsite)
     verify(seeked == here);
 }
 
- off_t output_emit_jump_with_patch_site(struct output* out) {
-         // Jump back to start of loop to recheck conditional expression.1
-    int oneconst = output_get_const_byte_data_offset(out, 1);
+off_t output_emit_jump_if_plus_with_patch_site(struct output* out, int datacharoffset) {
     output_emit_byte(out, opcode_branch_if_plus);
     off_t patchsite = output_emit_pointer_patch_site(out);
-    output_emit_data_pointer(out, oneconst);
+    output_emit_data_pointer(out, datacharoffset);
     return patchsite;
- }
+}
+
+void output_emit_jump_back_to_if_plus(struct output* out, off_t target_address, int datacharoffset) {
+    output_emit_byte(out, opcode_branch_if_plus);
+    output_emit_pointer_value(out, target_address);
+    output_emit_data_pointer(out, datacharoffset);
+}
+
+off_t output_emit_jump_with_patch_site(struct output* out) {
+    int zeroconst = output_get_const_byte_data_offset(out, 0);
+    return output_emit_jump_if_plus_with_patch_site(out, zeroconst);
+}
+
+void output_emit_jump_back_to(struct output* out, off_t target_address) {
+    int zeroconst = output_get_const_byte_data_offset(out, 0);
+    output_emit_jump_back_to_if_plus(out, target_address, zeroconst);
+}
 
 // Returns jump address patch site or -1 if no patch site was needed because value is always true.
 off_t output_emit_jump_if_zero_with_patch_site(struct output* out, struct value* val) {
@@ -1205,11 +1219,7 @@ off_t output_emit_jump_if_zero_with_patch_site(struct output* out, struct value*
 
         if (val->char_constant == 0) {
             // Need to jump past statement code.
-            output_emit_byte(out, opcode_branch_if_plus);
-            onfalsepatchsite = output_emit_pointer_patch_site(out);
-
-            int zerooffset = output_get_const_byte_data_offset(out, 0);
-            output_emit_data_pointer(out, zerooffset);
+            onfalsepatchsite = output_emit_jump_with_patch_site(out);
         }
 
     } else {
@@ -1223,18 +1233,15 @@ off_t output_emit_jump_if_zero_with_patch_site(struct output* out, struct value*
         //   0 --> 255   Fall through
         //   1 -->   0   Jump to if-body (true)
         output_emit_subtract_const(out, testrange, 1);
-        output_emit_byte(out, opcode_branch_if_plus);
-        int ontruepatchsite = output_emit_pointer_patch_site(out);
-        output_emit_data_pointer(out, testrange);
+        int ontruepatchsite = output_emit_jump_if_plus_with_patch_site(out, testrange);
 
         // Handle range 129 -- 255 indicating true:
         // 255 --> 254 --> 255   Fall through to if-body (true)
         //   0 --> 255 -->   0   Jump past if-body (false)
         //   1 -->   0 -->   1   N/A, already jumped to if-body above (true)
         output_emit_add_const(out, testrange, 1);
-        output_emit_byte(out, opcode_branch_if_plus);
-        onfalsepatchsite = output_emit_pointer_patch_site(out);
-        output_emit_data_pointer(out, testrange);
+        onfalsepatchsite = output_emit_jump_if_plus_with_patch_site(out, testrange);
+
         output_pop_tempbyte(out);
 
         output_backpatch_address_pointing_here(out, ontruepatchsite);
@@ -1475,6 +1482,7 @@ int process_additive_expression(struct stream* s, struct value* val_out, struct 
         return 0;
     }
 
+    int resultdata = -1;
     char op = match_plus_or_minus(s);
     while (op) {
         struct value rhs;
@@ -1485,8 +1493,12 @@ int process_additive_expression(struct stream* s, struct value* val_out, struct 
             return 0;
         }
 
-        // Subtract or add
-        int resultdata = buffer_expand(&(prog_out->data), 1);
+        // Do subtract or add
+
+        if (resultdata == -1) {
+            resultdata = buffer_expand(&(prog_out->data), 1);
+        }
+
         int lhsdata = output_make_data_byte_offset(prog_out, val_out);
         int rhsdata = output_make_data_byte_offset(prog_out, &rhs);
 
@@ -1509,13 +1521,103 @@ int process_additive_expression(struct stream* s, struct value* val_out, struct 
 }
 
 /*
+    N2176: 6.5.8: relational-expression
+        relational-expression <-
+            shift-expression
+            / relational-expression LT shift-expression
+            / relational-expression GT shift-expression
+            / relational-expression LE shift-expression
+            / relational-expression GE shift-expression
+
+    Implemented:
+        relational_expression <-
+            additive_expression (LT (additive_expression / fail))?
+            LT <- '<' ![=] spacing
+
+    Example:
+        count - 1 < reserved
+        digit < '0'
+        putchar('H')
+        abort()
+*/
+int process_relational_expression(struct stream* s, struct value* val_out, struct output* prog_out) {
+    if (!process_additive_expression(s, val_out, prog_out)) {
+        return 0;
+    }
+
+    int resultdata = -1;
+    while (match_string_not_followed_by_char_but_with_spaces(s, "<", "=")) {
+        struct value rhs;
+        value_init(&rhs);
+
+        if (!process_additive_expression(s, &rhs, prog_out)) {
+            fail_expected(s, "additive expression after relational operator");
+            return 0;
+        }
+
+        // Compare
+        if (resultdata == -1) {
+            resultdata = buffer_expand(&(prog_out->data), 1);
+        }
+
+        int lhsdata = output_make_data_byte_offset(prog_out, val_out);
+        int rhsdata = output_make_data_byte_offset(prog_out, &rhs);
+
+        int on_lhspos = output_emit_jump_if_plus_with_patch_site(prog_out, lhsdata);
+
+        // lhsdata < 0
+
+        int on_true = output_emit_jump_if_plus_with_patch_site(prog_out, rhsdata);
+
+
+        off_t samesign_label = output_get_address_here(prog_out);
+        // (lhsdata < 0 && rhsdata < 0) || (lhsdata >= 0 && rhsdata >= 0)
+
+        // 2 - 1  -->   1  -->  false  -->  0
+        // 2 - 2  -->   0  -->  false  -->  0
+        // 1 - 2  -->  -2  -->  true   -->  1
+        output_emit_move(prog_out, resultdata, lhsdata);
+        output_emit_subtract(prog_out, resultdata, rhsdata);
+
+        int on_false = output_emit_jump_if_plus_with_patch_site(prog_out, resultdata);
+        // (lhsdata < 0 && rhsdata >= 0)
+
+        // True
+        output_backpatch_address_pointing_here(prog_out, on_true);
+
+        // (((lhsdata < 0 && rhsdata < 0) || (lhsdata >= 0 && rhsdata >= 0)) && (lhs - rhs) <= 0) || (lhsdata < 0 && rhsdata >= 0)
+        output_emit_set_zero(prog_out, resultdata);
+        output_emit_add_const(prog_out, resultdata, 1);
+
+        int on_end = output_emit_jump_with_patch_site(prog_out);
+
+        output_backpatch_address_pointing_here(prog_out, on_lhspos);
+        // lhsdata >= 0
+
+        output_emit_jump_back_to_if_plus(prog_out, samesign_label, rhsdata);
+        // lhsdata >= 0 && rhs < 0 --> false
+
+        // False
+        output_backpatch_address_pointing_here(prog_out, on_false);
+        output_emit_set_zero(prog_out, resultdata);
+
+        output_backpatch_address_pointing_here(prog_out, on_end);
+        value_init(val_out);
+        val_out->type = vt_char_data;
+        val_out->char_data_offset = resultdata;
+    }
+
+    return 1;
+}
+
+/*
     N2176: 6.5.15 conditional-expression:
         conditional-expression <-
             logical-OR-expression
             / logical-OR-expression QUERY expression COLON conditional-expression
 
     Implemented:
-        conditional_expression <- additive_expression
+        conditional_expression <- relational_expression
 
     Examples:
         count - 1
@@ -1524,7 +1626,7 @@ int process_additive_expression(struct stream* s, struct value* val_out, struct 
         abort()
 */
 int process_conditional_expression(struct stream* s, struct value* val_out, struct output* prog_out) {
-    return process_additive_expression(s, val_out, prog_out);
+    return process_relational_expression(s, val_out, prog_out);
 }
 
 /*
