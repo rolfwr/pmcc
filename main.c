@@ -192,30 +192,57 @@ void value_init(struct value* val) {
     val->char_data_offset = -1;
 }
 
-struct buffer {
+// Generic and dynamically sized array.
+// Type specific dynamic arrays such as struct buffer and struct patchlist use
+// struct vector for low-level memory management.
+
+struct vector {
+    int element_size;
     int count;
-    int reserved;
-    char* bytes;
+    int reserved_count;
+    void* allocation;
 };
 
-void buffer_init(struct buffer* buf) {
-    buf->count = 0;
-    buf->reserved = 16;
-    buf->bytes = (char*)xmalloc(buf->reserved);
+void vector_init(struct vector* vec, int element_size, int reserve_count) {
+    vec->element_size = element_size;
+    vec->count = 0;
+    vec->reserved_count = reserve_count;
+    vec->allocation = xmalloc(vec->reserved_count * vec->element_size);
 }
 
-int buffer_expand(struct buffer* buf, int count) {
-    int index = buf->count;
-    buf->count = buf->count + count;
-    if (buf->count > buf->reserved) {
-        buf->reserved = buf->count * 2;
-        buf->bytes = (char*)xrealloc(buf->bytes, buf->reserved);
+int vector_expand(struct vector* vec, int count) {
+    int index = vec->count;
+    vec->count = vec->count + count;
+    if (vec->count > vec->reserved_count) {
+        vec->reserved_count = vec->count * 2;
+        vec->allocation = xrealloc(vec->allocation, vec->reserved_count * vec->element_size);
     }
     return index;
 }
 
+struct buffer {
+    struct vector bytes;
+};
+
+void buffer_init(struct buffer* buf) {
+    vector_init(&(buf->bytes), 1, 16);
+}
+
+int buffer_expand(struct buffer* buf, int count) {
+    return vector_expand(&(buf->bytes), count);
+}
+
 char* buffer_at(struct buffer* buf, int index) {
-    return &(buf->bytes[index]);
+    char* bytes = (char*)(buf->bytes.allocation);
+    return &(bytes[index]);
+}
+
+int buffer_size(struct buffer* buf) {
+    return buf->bytes.count;
+}
+
+void* buffer_data(struct buffer* buf) {
+    return buf->bytes.allocation;
 }
 
 struct constbytetable {
@@ -237,43 +264,42 @@ struct patch {
 };
 
 struct patchlist {
-    int count;
-    int reserved;
-    struct patch* entries;
+    struct vector patches;
 };
 
 void patchlist_init(struct patchlist* pl) {
-    pl->count = 0;
-    pl->reserved = 16;
-    pl->entries = (struct patch*)xmalloc(pl->reserved * sizeof(struct patch));
+    vector_init(&(pl->patches), sizeof(struct patch), 16);
 }
 
 void patchlist_push(struct patchlist* pl) {
-    assert(pl->count <= pl->reserved);
-    if (pl->count == pl->reserved) {
-        assert(pl->reserved > 0);
-        pl->reserved = pl->reserved * 2;
-        pl->entries = (struct patch*)xrealloc(pl->entries, pl->reserved * sizeof(struct patch));
-    }
+    vector_expand(&(pl->patches), 1);
+}
 
-    pl->count = pl->count + 1;
-    assert(pl->count <= pl->reserved);
+struct patch* patchlist_at(struct patchlist* pl, int index) {
+    struct patch* elements = (struct patch*)(pl->patches.allocation);
+    return &(elements[index]);
+}
+
+int patchlist_count(struct patchlist* pl) {
+    return pl->patches.count;
 }
 
 struct patch* patchlist_back(struct patchlist* pl) {
-    return &(pl->entries[pl->count - 1]);
+    return patchlist_at(pl, patchlist_count(pl) - 1);
 }
 
 // symbol kinds
 enum {
-    st_none,
-    st_variable,
-    st_function
+    sk_none,
+    sk_variable,
+    sk_function
 };
 
+// type specifiers
 enum {
     ts_none,
     ts_undefined,
+    ts_void,
     ts_char,
     ts_int
 };
@@ -289,29 +315,34 @@ struct symbol {
     int typespec;
     // compilation specific
     int dataoffset;
+    int funcaddr;
+    int returnpatchsite;
 };
 
 void symbol_init(struct symbol* sym, char* name) {
     sym->name = name;
-    sym->kind = st_none;
+    sym->kind = sk_none;
     sym->typespec = ts_none;
     sym->dataoffset = -1;
+    sym->funcaddr = -1;
+    sym->returnpatchsite = -1;
 }
 
 struct symboltable {
-    struct symbol entries[16];
-    int count;
+    struct vector symbols;
 };
 
 void symboltable_init(struct symboltable* symtab) {
-    memset(symtab, 0, sizeof(struct symboltable));
+    vector_init(&(symtab->symbols), sizeof(struct symbol), 16);
 }
 
 struct symbol* symboltable_find(struct symboltable* symtab, char* name) {
     int i = 0;
-    while (i < symtab->count) {
-        if (strcmp(name, symtab->entries[i].name) == 0) {
-            return &(symtab->entries[i]);
+    struct symbol* elements = (struct symbol*)(symtab->symbols.allocation);
+    while (i < symtab->symbols.count) {
+        struct symbol* entry = &(elements[i]);
+        if (strcmp(name, entry->name) == 0) {
+            return entry;
         }
 
         i = i + 1;
@@ -321,9 +352,9 @@ struct symbol* symboltable_find(struct symboltable* symtab, char* name) {
 
 struct symbol* symboltable_add(struct symboltable* symtab, char* name) {
     assert(symboltable_find(symtab, name) == 0);
-    verify(symtab->count < 16);
-    struct symbol* new_entry = &(symtab->entries[symtab->count]);
-    symtab->count = symtab->count + 1;
+    int index = vector_expand(&(symtab->symbols), 1);
+    struct symbol* elements = (struct symbol*)(symtab->symbols.allocation);
+    struct symbol* new_entry = &(elements[index]);
     symbol_init(new_entry, name);
     return new_entry;
 }
@@ -336,6 +367,7 @@ struct output {
     struct symboltable symbols;
     int tempbyteoffsets[16];
     int tempbytecount;
+    int mainjumppatchsite;
 };
 
 void output_init(struct output* o, int fd) {
@@ -353,6 +385,7 @@ void output_init(struct output* o, int fd) {
     }
 
     o->tempbytecount = 0;
+    o->mainjumppatchsite = -1;
 }
 
 int output_get_const_byte_data_offset(struct output* o, char value) {
@@ -569,6 +602,7 @@ int match_word(struct stream* s, const char* expected) {
 
     Implemented:
         type_specifier <- CHAR / INT
+        VOID <- 'void' !id_char spacing
         CHAR <- 'char' !id_char spacing
         INT <- 'char' !id_char spacing
 
@@ -577,6 +611,10 @@ int match_word(struct stream* s, const char* expected) {
         "int\r\n"
 */
 int match_type_specifier(struct stream* s) {
+    if (match_word(s, "void")) {
+        return ts_void;
+    }
+
     if (match_word(s, "char")) {
         return ts_char;
     }
@@ -604,6 +642,7 @@ int match_type_specifier(struct stream* s) {
     Examples (C-like syntax):
         "char "
         "int\r\n"
+        "void "
 */
 int match_declaration_specifiers(struct stream* s) {
     return match_type_specifier(s);
@@ -684,7 +723,7 @@ int read_direct_declarator(struct stream* s, struct symbol* decl_out) {
 
     if (!match_string_with_spacing(s, "(")) {
         stream_seek(s, pos);
-        decl_out->kind = st_variable;
+        decl_out->kind = sk_variable;
         return 1;
     }
 
@@ -692,11 +731,11 @@ int read_direct_declarator(struct stream* s, struct symbol* decl_out) {
         fail_expected(s, "')'");
 
         stream_seek(s, pos);
-        decl_out->kind = st_variable;
+        decl_out->kind = sk_variable;
         return 1;
     }
 
-    decl_out->kind = st_function;
+    decl_out->kind = sk_function;
     return 1;
 }
 
@@ -1100,7 +1139,7 @@ int output_make_data_byte_offset(struct output* prog_out, struct value* val) {
     // variable identifiers (someVariable)
     struct symbol* sym = symboltable_find(&(prog_out->symbols), val->identifier);
     assert(strcmp(sym->name, val->identifier) == 0);
-    verify(sym->kind == st_variable);
+    verify(sym->kind == sk_variable);
     verify(sym->typespec == ts_char);
     verify(sym->dataoffset != -1);
     return sym -> dataoffset;
@@ -1171,6 +1210,23 @@ void output_emit_pointer_value(struct output* out, int pointer_value) {
         pointer_value = pointer_value >> 8;
         i = i + 1;
     }
+}
+
+void output_emit_runtime_patch_move(struct output* out, int targetpc, int sourcedataoffset) {
+    int negtemp = output_push_tempbyte(out);
+    output_emit_negate(out, negtemp, sourcedataoffset);
+
+    // patching set zero
+    output_emit_byte(out, opcode_subtract);
+    output_emit_pointer_value(out, targetpc);
+    output_emit_pointer_value(out, targetpc);
+
+    // patching add (subtract negative)
+    output_emit_byte(out, opcode_subtract);
+    output_emit_pointer_value(out, targetpc);
+    output_emit_data_pointer(out, negtemp);
+
+    output_pop_tempbyte(out);
 }
 
 void output_backpatch_address_pointing_here(struct output* out, off_t patchsite) {
@@ -1305,6 +1361,44 @@ int process_postfix_expression(struct stream* s, struct value* val_out, struct o
     }
 
     verify(val_out->type == vt_identifier);
+
+    struct symbol* func = symboltable_find(&(prog_out->symbols), val_out->identifier);
+    if (func != 0) {
+        verify(func->kind == sk_function);
+
+        // For now, only support stackless, non-recursive functions.
+        verify(args.count == 0);
+
+        // Emit code to patch instruction to jump back after function call.
+        // The address to jump back to will be stored in the data segment, and
+        // will be compied to the patch site right before jumping to the
+        // function.
+
+        // We'll fill in the return address value later. For now, just reserve
+        // the space.
+        int returnaddrdata = buffer_expand(&(prog_out->data), 4);
+        assert(func->returnpatchsite != -1);
+
+        for (int i = 0; i < 4; ++i) {
+            off_t pctarget = func->returnpatchsite + i;
+            output_emit_runtime_patch_move(prog_out, pctarget, returnaddrdata + i);
+        }
+
+        assert(func->funcaddr != -1);
+        output_emit_jump_back_to(prog_out, func->funcaddr);
+
+        int returnaddrvalue = output_get_address_here(prog_out);
+
+        // Now that we know the exact address to return to, store that in
+        // the data segement where we will copy the value from at runtime.
+        for (int i = 0; i < 4; ++i) {
+            *buffer_at(&(prog_out->data), returnaddrdata + i) = returnaddrvalue & 255;
+            returnaddrvalue = returnaddrvalue >> 8;
+        }
+
+        return 1;
+    }
+
     verify(strcmp(val_out->identifier, "putchar") == 0);
 
     verify(args.count == 1);
@@ -1728,7 +1822,7 @@ int process_assignment_expression(struct stream* s, struct value* val_out, struc
         verify(variable != 0);
         assert(strcmp(variable->name, val_out->identifier) == 0);
 
-        verify(variable->kind == st_variable);
+        verify(variable->kind == sk_variable);
         verify(variable->typespec == ts_char);
         int vardataoffset = variable->dataoffset;
 
@@ -2159,7 +2253,7 @@ int process_function_definition(struct stream* s, struct output* prog_out) {
         return 0;
     }
 
-    if (func.kind != st_function) {
+    if (func.kind != sk_function) {
         // Not a function definition. Probably a declaration instead.
 
         // TODO: Avoid duplicate parsing of declaration_specifiers and
@@ -2169,16 +2263,38 @@ int process_function_definition(struct stream* s, struct output* prog_out) {
         return 0;
     }
 
-    assert(func.kind == st_function);
+    assert(func.kind == sk_function);
 
-    verify(strcmp(func.name, "main") == 0);
+    verify(symboltable_find(&(prog_out->symbols), func.name) == 0);
+    struct symbol* newfunc = symboltable_add(&(prog_out->symbols), func.name);
+    memcpy(newfunc, &func, sizeof(struct symbol));
+    assert(strcmp(newfunc->name, func.name) == 0);
+
+    char ismain = strcmp(func.name, "main") == 0;
+    if (ismain) {
+        int patchsite = prog_out->mainjumppatchsite;
+        prog_out->mainjumppatchsite = 0;
+        if (patchsite > 0) {
+            output_backpatch_address_pointing_here(prog_out, patchsite);
+        }
+    } else {
+        if (prog_out->mainjumppatchsite == -1) {
+            prog_out->mainjumppatchsite = output_emit_jump_with_patch_site(prog_out);
+        }
+    }
+
+    newfunc->funcaddr = output_get_address_here(prog_out);
 
     if (!process_compound_statement(s, prog_out)) {
         stream_seek(s, pos);
         return 0;
     }
 
-    output_emit_byte(prog_out, opcode_halt);
+    if (ismain) {
+        output_emit_byte(prog_out, opcode_halt);
+    } else {
+        newfunc->returnpatchsite = output_emit_jump_with_patch_site(prog_out);
+    }
     return 1;
 }
 
@@ -2238,10 +2354,11 @@ int main(int argc, char** argv) {
 
     // Backpatch pointers to data segment, now that we know where the data segment is.
     int i = 0;
-    while (i < prog.patches.count) {
-        off_t sr = lseek(prog.fd, prog.patches.entries[i].target, SEEK_SET);
+    while (i < patchlist_count(&(prog.patches))) {
+        struct patch* entry = patchlist_at(&(prog.patches), i);
+        off_t sr = lseek(prog.fd, entry->target, SEEK_SET);
         verify(sr != -1);
-        int data_offset = prog.patches.entries[i].offset;
+        int data_offset = entry->offset;
         int addr = data_start + data_offset;
 
         // Write little endian 32 bit pointer.
@@ -2254,8 +2371,8 @@ int main(int argc, char** argv) {
 
     // Write data segment.
 
-    int wrote = write(prog.fd, prog.data.bytes, prog.data.count);
-    verify(wrote == prog.data.count);
+    int wrote = write(prog.fd, buffer_data(&(prog.data)), buffer_size(&(prog.data)));
+    verify(wrote == buffer_size(&(prog.data)));
 
     int cr = close(outfd);
     verify(cr == 0);
