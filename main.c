@@ -171,25 +171,46 @@ void fail_expected(struct stream* s, const char* expected) {
     abort();
 }
 
+// value storage
 enum {
-    vt_none,
-    vt_identifier,
-    vt_char_constant,
-    vt_char_data
+    vs_none,
+    vs_unresolved_identifier,
+    vs_constant,
+    vs_data_offset,
+    vs_pc_offset
+};
+
+
+// type specifiers
+enum {
+    ts_none,
+    ts_unresolved,
+    ts_void,
+    ts_char,
+    ts_int,
+    ts_function
 };
 
 struct value {
-    int type;
+    int storage;
+    int typespecifier;
 
-    // One of
     char* identifier;
     char char_constant;
-    int char_data_offset;
+    int data_offset;
+
+    int ispointer;
+
+    // compilation specific
+    int funcaddr;
+    int returnpatchsite;
 };
 
 void value_init(struct value* val) {
     memset(val, 0, sizeof(struct value));
-    val->char_data_offset = -1;
+    val->data_offset = -1;
+    val->funcaddr = -1;
+    val->returnpatchsite = -1;
 }
 
 // Generic and dynamically sized array.
@@ -288,44 +309,22 @@ struct patch* patchlist_back(struct patchlist* pl) {
     return patchlist_at(pl, patchlist_count(pl) - 1);
 }
 
-// symbol kinds
-enum {
-    sk_none,
-    sk_variable,
-    sk_function
-};
-
-// type specifiers
-enum {
-    ts_none,
-    ts_undefined,
-    ts_void,
-    ts_char,
-    ts_int
-};
-
-int typespecifier_sizeof(int typespec) {
-    verify(typespec == ts_char);
-    return 1;
-}
-
 struct symbol {
-    char* name;
-    int kind;
-    int typespec;
-    // compilation specific
-    int dataoffset;
-    int funcaddr;
-    int returnpatchsite;
+    struct value val;
 };
 
 void symbol_init(struct symbol* sym, char* name) {
-    sym->name = name;
-    sym->kind = sk_none;
-    sym->typespec = ts_none;
-    sym->dataoffset = -1;
-    sym->funcaddr = -1;
-    sym->returnpatchsite = -1;
+    value_init(&(sym->val));
+    sym->val.identifier = name;
+}
+
+int value_sizeof(struct value* val) {
+    if (val->ispointer) {
+        return 4;
+    }
+
+    verify(val->typespecifier == ts_char);
+    return 1;
 }
 
 struct symboltable {
@@ -341,7 +340,7 @@ struct symbol* symboltable_find(struct symboltable* symtab, char* name) {
     struct symbol* elements = (struct symbol*)(symtab->symbols.allocation);
     while (i < symtab->symbols.count) {
         struct symbol* entry = &(elements[i]);
-        if (strcmp(name, entry->name) == 0) {
+        if (strcmp(name, entry->val.identifier) == 0) {
             return entry;
         }
 
@@ -717,26 +716,57 @@ int read_direct_declarator(struct stream* s, struct symbol* decl_out) {
         return 0;
     }
 
-    decl_out->name = name;
+    decl_out->val.identifier = name;
 
     off_t pos = stream_tell(s);
 
     if (!match_string_with_spacing(s, "(")) {
         stream_seek(s, pos);
-        decl_out->kind = sk_variable;
+        decl_out->val.typespecifier = ts_unresolved;
         return 1;
     }
 
     if (!match_string_with_spacing(s, ")")) {
         fail_expected(s, "')'");
-
-        stream_seek(s, pos);
-        decl_out->kind = sk_variable;
-        return 1;
+        return 0;
     }
 
-    decl_out->kind = sk_function;
+    decl_out->val.typespecifier = ts_function;
     return 1;
+}
+
+int match_string_not_followed_by_char_but_with_spaces(struct stream* s, const char* str, const char* disallowed_chars) {
+    off_t pos = stream_tell(s);
+    if (!match_string(s, str)) {
+        return 0;
+    }
+
+    off_t after = stream_tell(s);
+    int ic = stream_read_char(s);
+    while (*disallowed_chars) {
+        if (ic == *disallowed_chars) {
+            stream_seek(s, pos);
+            return 0;
+        }
+
+        disallowed_chars = disallowed_chars + 1;
+    }
+
+    stream_seek(s, after);
+    count_spacing(s);
+    return 1;
+}
+
+/*
+    N2176 6.7.7 pointer:
+        pointer <- STAR type_qualifier_list? / STAR  type_qualifier_list? pointer
+
+    Implemented:
+        pointer <- STAR
+        STAR <-  '*' ![=] spacing
+*/
+int match_pointer(struct stream* s) {
+    return match_string_not_followed_by_char_but_with_spaces(s, "*", "=");
 }
 
 /*
@@ -744,16 +774,27 @@ int read_direct_declarator(struct stream* s, struct symbol* decl_out) {
         delarator <- pointer? direct-declarator
 
     Implemented:
-        declarator <- direct_declarator
+        declarator <- pointer? direct_declarator
 
     Examples:
         main()
         main ( )
         byte_count
-        lf
+        * str
 */
 int read_declarator(struct stream* s, struct symbol* decl_out) {
-    return read_direct_declarator(s, decl_out);
+    off_t pos = stream_tell(s);
+
+    int ispointer = match_pointer(s);
+
+    if (!read_direct_declarator(s, decl_out)) {
+        stream_seek(s, pos);
+        return 0;
+    }
+
+    decl_out->val.ispointer = ispointer;
+
+    return 1;
 }
 
 /*
@@ -946,7 +987,8 @@ int match_decimal_constant(struct stream* s, struct value* val_out) {
             }
 
             int before = result;
-            val_out->type = vt_char_constant;
+            val_out->storage = vs_constant;
+            val_out->typespecifier = ts_char;
             val_out->char_constant = result;
 
             // Catch compile-time overflow
@@ -995,7 +1037,7 @@ int match_integer_constant(struct stream* s, struct value* val_out) {
         '\n'
 */
 int match_constant(struct stream* s, struct value* val_out) {
-    assert(val_out->type == vt_none);
+    assert(val_out->storage == vs_none);
 
     if (match_integer_constant(s, val_out)) {
         return 1;
@@ -1007,7 +1049,8 @@ int match_constant(struct stream* s, struct value* val_out) {
         return 0;
     }
 
-    val_out->type = vt_char_constant;
+    val_out->storage = vs_constant;
+    val_out->typespecifier = ts_char;
     val_out->char_constant = charconst;
     return 1;
 }
@@ -1057,7 +1100,8 @@ int process_expression(struct stream* s, struct value* val_out, struct output* p
 int process_primary_expression(struct stream* s, struct value* out_val, struct output* prog_out) {
     char* id = read_identifier(s);
     if (id) {
-        out_val->type = vt_identifier;
+        out_val->storage = vs_unresolved_identifier;
+        out_val->typespecifier = ts_unresolved;
         out_val->identifier = id;
         return 1;
     }
@@ -1118,31 +1162,39 @@ void output_emit_data_pointer(struct output* prog_out, int data_offset) {
     addrpatch->target = patch_site;
 }
 
+int value_is_of_basic_type(struct value* val, int basictypespec) {
+    if (val->ispointer) {
+        return 0;
+    }
+
+    return val->typespecifier == basictypespec;
+}
+
 /*
     Implemented:
         character constants ('c')
         variable identifiers (someVariable)
 */
 int output_make_data_byte_offset(struct output* prog_out, struct value* val) {
-    if (val->type == vt_char_constant) {
+    if (val->storage == vs_constant && val->typespecifier == ts_char) {
         // character constants ('c')
         return output_get_const_byte_data_offset(prog_out, val->char_constant);
     }
 
-    if (val->type == vt_char_data) {
-        assert(val->char_data_offset != -1);
-        return val->char_data_offset;
+    if (val->storage == vs_data_offset && val->typespecifier == ts_char) {
+        assert(val->data_offset != -1);
+        return val->data_offset;
     }
 
-    verify(val->type == vt_identifier);
+    verify(val->storage == vs_unresolved_identifier);
 
     // variable identifiers (someVariable)
     struct symbol* sym = symboltable_find(&(prog_out->symbols), val->identifier);
-    assert(strcmp(sym->name, val->identifier) == 0);
-    verify(sym->kind == sk_variable);
-    verify(sym->typespec == ts_char);
-    verify(sym->dataoffset != -1);
-    return sym -> dataoffset;
+    assert(strcmp(sym->val.identifier, val->identifier) == 0);
+    verify(sym->val.storage == vs_data_offset);
+    verify(value_is_of_basic_type(&(sym->val), ts_char));
+    verify(sym->val.data_offset != -1);
+    return sym->val.data_offset;
 }
 
 /*
@@ -1268,11 +1320,7 @@ void output_emit_jump_back_to(struct output* out, off_t target_address) {
 off_t output_emit_jump_if_zero_with_patch_site(struct output* out, struct value* val) {
     off_t onfalsepatchsite = -1;
 
-    if (val->type == vt_char_constant) {
-
-        // Only support constant conditionals right now.
-        verify(val->type == vt_char_constant);
-
+    if (val->storage == vs_constant && val->typespecifier == ts_char) {
         if (val->char_constant == 0) {
             // Need to jump past statement code.
             onfalsepatchsite = output_emit_jump_with_patch_site(out);
@@ -1336,13 +1384,14 @@ off_t output_emit_jump_if_zero_with_patch_site(struct output* out, struct value*
         ^^^^^ ERROR: called primary expression is not a function nor a function pointer
 */
 int process_postfix_expression(struct stream* s, struct value* val_out, struct output* prog_out) {
-    assert(val_out->type == vt_none);
+    assert(val_out->storage == vs_none);
 
     if (!process_primary_expression(s, val_out, prog_out)) {
         return 0;
     }
 
-    assert(val_out->type != vt_none);
+    assert(val_out->storage != vs_none);
+    assert(val_out->typespecifier != ts_none);
 
     off_t pos = stream_tell(s);
     if (!match_string_with_spacing(s, "(")) {
@@ -1360,11 +1409,12 @@ int process_postfix_expression(struct stream* s, struct value* val_out, struct o
         return 1;
     }
 
-    verify(val_out->type == vt_identifier);
+    verify(val_out->storage == vs_unresolved_identifier);
 
     struct symbol* func = symboltable_find(&(prog_out->symbols), val_out->identifier);
     if (func != 0) {
-        verify(func->kind == sk_function);
+        verify(func->val.typespecifier == ts_function);
+        verify(func->val.storage = vs_pc_offset);
 
         // For now, only support stackless, non-recursive functions.
         verify(args.count == 0);
@@ -1377,15 +1427,15 @@ int process_postfix_expression(struct stream* s, struct value* val_out, struct o
         // We'll fill in the return address value later. For now, just reserve
         // the space.
         int returnaddrdata = buffer_expand(&(prog_out->data), 4);
-        assert(func->returnpatchsite != -1);
+        assert(func->val.returnpatchsite != -1);
 
         for (int i = 0; i < 4; ++i) {
-            off_t pctarget = func->returnpatchsite + i;
+            off_t pctarget = func->val.returnpatchsite + i;
             output_emit_runtime_patch_move(prog_out, pctarget, returnaddrdata + i);
         }
 
-        assert(func->funcaddr != -1);
-        output_emit_jump_back_to(prog_out, func->funcaddr);
+        assert(func->val.funcaddr != -1);
+        output_emit_jump_back_to(prog_out, func->val.funcaddr);
 
         int returnaddrvalue = output_get_address_here(prog_out);
 
@@ -1415,28 +1465,31 @@ int process_postfix_expression(struct stream* s, struct value* val_out, struct o
 
 /*
     N2176: 6.5.3 unary-operator:
-        AND / STAR / PLUS / MINUS / TILDE / BANG
+        unary-operator <- AND / STAR / PLUS / MINUS / TILDE / BANG
 
     Implemented:
-        BANG spacing
+        unary_operator <- ( AND / BANG ) spacing
+        AND <- '&' ![&]
+        BANG <- '!' ![=]
 
     Examples:
         !
+        &
 */
 char match_unary_operator(struct stream* s) {
-    off_t pos = stream_tell(s);
-    int ic = stream_read_char(s);
-    if (ic == -1) {
+    char c = 0;
+    if (match_string_not_followed_by_char_but_with_spaces(s, "&", "&")) {
+        c = '&';
+    } else if (match_string_not_followed_by_char_but_with_spaces(s, "!", "=")) {
+        c = '!';
+    }
+
+    if (!c) {
         return 0;
     }
-    char c = ic;
 
-    if (c == '!') {
-        return c;
-    }
-
-    stream_seek(s, pos);
-    return 0;
+    count_spacing(s);
+    return c;
 }
 
 /*
@@ -1472,6 +1525,32 @@ int process_unary_expression(struct stream* s, struct value* val_out, struct out
         return 0;
     }
 
+    if (op == '&') {
+        if (!process_unary_expression(s, val_out, prog_out)) {
+            fail_expected(s, "unary expression after '!'");
+            return 0;
+        }
+
+        // Only one level of pointers right now.
+        verify(!val_out->ispointer);
+
+        // Implement getting address
+        //int data_index = output_make_data_byte_offset(prog_out, val_out);
+
+        val_out->ispointer = 1;
+        int addressdata = buffer_expand(&(prog_out->data), value_sizeof(val_out));
+
+        // TODO: emit code to initialize addressdata, which will be backpatched
+        // with actual address values once we can calculate it from the start
+        // of the data segment and data_index.
+
+        val_out->storage = vs_data_offset;
+        val_out->data_offset = addressdata;
+        // The typespecifier is retained.
+
+        return 1;
+    }
+
     verify(op == '!');
 
     if (!process_unary_expression(s, val_out, prog_out)) {
@@ -1492,8 +1571,12 @@ int process_unary_expression(struct stream* s, struct value* val_out, struct out
     output_backpatch_address_pointing_here(prog_out, ontrue_output0);
 
     value_init(val_out);
-    val_out->type = vt_char_data;
-    val_out->char_data_offset = notdata;
+    val_out->storage = vs_data_offset;
+
+    // Deviation from standard C. We're using char rather than int to store
+    // bools to better support 8-bit targets.
+    val_out->typespecifier = ts_char;
+    val_out->data_offset = notdata;
     return 1;
 }
 
@@ -1519,28 +1602,6 @@ void note_processed_as(struct stream* s, off_t pos, const char* what) {
     write_string(STDERR_FILENO, "\n");
 
     assert(stream_tell(s) == here);
-}
-
-int match_string_not_followed_by_char_but_with_spaces(struct stream* s, const char* str, const char* disallowed_chars) {
-    off_t pos = stream_tell(s);
-    if (!match_string(s, str)) {
-        return 0;
-    }
-
-    off_t after = stream_tell(s);
-    int ic = stream_read_char(s);
-    while (*disallowed_chars) {
-        if (ic == *disallowed_chars) {
-            stream_seek(s, pos);
-            return 0;
-        }
-
-        disallowed_chars = disallowed_chars + 1;
-    }
-
-    stream_seek(s, after);
-    count_spacing(s);
-    return 1;
 }
 
 // PLUS <- '-' ![\-+=] spacing
@@ -1605,8 +1666,9 @@ int process_additive_expression(struct stream* s, struct value* val_out, struct 
         }
 
         value_init(val_out);
-        val_out->type = vt_char_data;
-        val_out->char_data_offset = resultdata;
+        val_out->storage = vs_data_offset;
+        val_out->typespecifier = ts_char;
+        val_out->data_offset = resultdata;
 
         op = match_plus_or_minus(s);
     }
@@ -1697,8 +1759,9 @@ int process_relational_expression(struct stream* s, struct value* val_out, struc
 
         output_backpatch_address_pointing_here(prog_out, on_end);
         value_init(val_out);
-        val_out->type = vt_char_data;
-        val_out->char_data_offset = resultdata;
+        val_out->storage = vs_data_offset;
+        val_out->typespecifier = ts_char;
+        val_out->data_offset = resultdata;
     }
 
     return 1;
@@ -1809,24 +1872,26 @@ int process_assignment_expression(struct stream* s, struct value* val_out, struc
 
         if (!process_assignment_expression(s, &aexpr, prog_out)) {
             note_processed_as(s, pos, "assignment operator");
-            fail_expected(s, "assignment expression after assignement operator");
+            fail_expected(s, "assignment expression after assignment operator");
             stream_seek(s, pos);
         }
 
         // Handle specifically:
         //     someVariableName = '?'
 
-        verify(val_out->type == vt_identifier);
+        verify(val_out->storage == vs_unresolved_identifier);
 
         struct symbol* variable = symboltable_find(&(prog_out->symbols), val_out->identifier);
         verify(variable != 0);
-        assert(strcmp(variable->name, val_out->identifier) == 0);
+        assert(strcmp(variable->val.identifier, val_out->identifier) == 0);
 
-        verify(variable->kind == sk_variable);
-        verify(variable->typespec == ts_char);
-        int vardataoffset = variable->dataoffset;
+        verify(variable->val.storage == vs_data_offset);
 
-        if (aexpr.type == vt_char_constant) {
+        verify(value_is_of_basic_type(&(variable->val), ts_char));
+        int vardataoffset = variable->val.data_offset;
+
+        if (aexpr.storage == vs_constant) {
+            verify(aexpr.typespecifier == ts_char);
             int negconstoffset = output_get_const_byte_data_offset(prog_out, (256 - aexpr.char_constant) & 255);
             output_emit_negate(prog_out, vardataoffset, negconstoffset);
         } else {
@@ -2163,21 +2228,22 @@ int process_declaration(struct stream* s, struct output* prog_out) {
     //     char someVariableName;
     verify(typespec == ts_char);
 
-    verify(symboltable_find(&(prog_out->symbols), decllist.name) == 0);
+    verify(symboltable_find(&(prog_out->symbols), decllist.val.identifier) == 0);
 
-    struct symbol* newvar = symboltable_add(&(prog_out->symbols), decllist.name);
+    struct symbol* newvar = symboltable_add(&(prog_out->symbols), decllist.val.identifier);
 
     assert(newvar != 0);
-    assert(strcmp(newvar->name, decllist.name) == 0);
+    assert(strcmp(newvar->val.identifier, decllist.val.identifier) == 0);
     memcpy(newvar, &decllist, sizeof(struct symbol));
 
-    newvar->typespec = typespec;
+    newvar->val.typespecifier = typespec;
+    newvar->val.storage = vs_data_offset;
 
     // Make appropriate amount of room for the new variable, and remember where
     // we put it.
-    newvar->dataoffset = buffer_expand(&(prog_out->data), typespecifier_sizeof(newvar->typespec));
+    newvar->val.data_offset = buffer_expand(&(prog_out->data), value_sizeof(&(newvar->val)));
 
-    assert(symboltable_find(&(prog_out->symbols), decllist.name) == newvar);
+    assert(symboltable_find(&(prog_out->symbols), decllist.val.identifier) == newvar);
 
     return 1;
 }
@@ -2253,7 +2319,7 @@ int process_function_definition(struct stream* s, struct output* prog_out) {
         return 0;
     }
 
-    if (func.kind != sk_function) {
+    if (func.val.typespecifier != ts_function) {
         // Not a function definition. Probably a declaration instead.
 
         // TODO: Avoid duplicate parsing of declaration_specifiers and
@@ -2263,14 +2329,14 @@ int process_function_definition(struct stream* s, struct output* prog_out) {
         return 0;
     }
 
-    assert(func.kind == sk_function);
+    assert(func.val.typespecifier == ts_function);
 
-    verify(symboltable_find(&(prog_out->symbols), func.name) == 0);
-    struct symbol* newfunc = symboltable_add(&(prog_out->symbols), func.name);
+    verify(symboltable_find(&(prog_out->symbols), func.val.identifier) == 0);
+    struct symbol* newfunc = symboltable_add(&(prog_out->symbols), func.val.identifier);
     memcpy(newfunc, &func, sizeof(struct symbol));
-    assert(strcmp(newfunc->name, func.name) == 0);
+    assert(strcmp(newfunc->val.identifier, func.val.identifier) == 0);
 
-    char ismain = strcmp(func.name, "main") == 0;
+    char ismain = strcmp(func.val.identifier, "main") == 0;
     if (ismain) {
         int patchsite = prog_out->mainjumppatchsite;
         prog_out->mainjumppatchsite = 0;
@@ -2283,7 +2349,7 @@ int process_function_definition(struct stream* s, struct output* prog_out) {
         }
     }
 
-    newfunc->funcaddr = output_get_address_here(prog_out);
+    newfunc->val.funcaddr = output_get_address_here(prog_out);
 
     if (!process_compound_statement(s, prog_out)) {
         stream_seek(s, pos);
@@ -2293,7 +2359,7 @@ int process_function_definition(struct stream* s, struct output* prog_out) {
     if (ismain) {
         output_emit_byte(prog_out, opcode_halt);
     } else {
-        newfunc->returnpatchsite = output_emit_jump_with_patch_site(prog_out);
+        newfunc->val.returnpatchsite = output_emit_jump_with_patch_site(prog_out);
     }
     return 1;
 }
